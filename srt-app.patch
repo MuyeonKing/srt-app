@@ -1,0 +1,498 @@
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
+index 8bcae71..6f94729 100644
+--- a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
+@@ -4,19 +4,20 @@ import android.os.Bundle
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.activity.viewModels
+-import com.whispercppdemo.ui.main.MainScreen
+-import com.whispercppdemo.ui.main.MainScreenViewModel
++import androidx.compose.material3.Surface
++import com.whispercppdemo.subtitle.SubtitleScreen
++import com.whispercppdemo.subtitle.SubtitleViewModel
+ import com.whispercppdemo.ui.theme.WhisperCppDemoTheme
+ 
+ class MainActivity : ComponentActivity() {
+-    private val viewModel: MainScreenViewModel by viewModels { MainScreenViewModel.factory() }
++    private val vm: SubtitleViewModel by viewModels()
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setContent {
+             WhisperCppDemoTheme {
+-                MainScreen(viewModel)
++                Surface { SubtitleScreen(vm) }
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/AudioDecoder.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/AudioDecoder.kt
+new file mode 100644
+index 0000000..9a2337f
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/AudioDecoder.kt
+@@ -0,0 +1,172 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import android.media.AudioFormat
++import android.media.MediaCodec
++import android.media.MediaExtractor
++import android.media.MediaFormat
++import android.net.Uri
++import java.io.BufferedOutputStream
++import java.io.File
++import java.io.FileOutputStream
++import java.io.OutputStream
++import java.io.RandomAccessFile
++import java.nio.ByteOrder
++
++/**
++ * 영상 파일의 오디오를 whisper.cpp 입력 형식(16kHz, 모노)으로 변환한다.
++ * 2시간 분량을 한 번에 메모리에 올리지 않도록, 16bit PCM 임시 파일로 저장한 뒤
++ * readChunk()로 구간 단위로 읽어 쓴다.
++ */
++object AudioDecoder {
++    const val TARGET_RATE = 16_000
++
++    /** @return 저장된 총 샘플 수 (16kHz 기준) */
++    fun decodeToPcm16k(
++        context: Context,
++        uri: Uri,
++        outFile: File,
++        onProgress: (Int) -> Unit = {}
++    ): Long {
++        val extractor = MediaExtractor()
++        extractor.setDataSource(context, uri, null)
++        val track = (0 until extractor.trackCount).firstOrNull {
++            extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
++        } ?: throw IllegalArgumentException("영상에 오디오 트랙이 없습니다")
++        extractor.selectTrack(track)
++
++        val inFormat = extractor.getTrackFormat(track)
++        val durationUs = if (inFormat.containsKey(MediaFormat.KEY_DURATION)) inFormat.getLong(MediaFormat.KEY_DURATION) else 0L
++        val codec = MediaCodec.createDecoderByType(inFormat.getString(MediaFormat.KEY_MIME)!!)
++        codec.configure(inFormat, null, null, 0)
++        codec.start()
++
++        var channels = inFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
++        var encoding = AudioFormat.ENCODING_PCM_16BIT
++        val resampler = LinearResampler(TARGET_RATE).apply {
++            setSourceRate(inFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE))
++        }
++        val info = MediaCodec.BufferInfo()
++        var inputDone = false
++        var outputDone = false
++        var lastPercent = -1
++
++        try {
++            return BufferedOutputStream(FileOutputStream(outFile), 1 shl 16).use { fileOut ->
++                val writer = PcmWriter(fileOut)
++                while (!outputDone) {
++                    if (!inputDone) {
++                        val inIdx = codec.dequeueInputBuffer(10_000)
++                        if (inIdx >= 0) {
++                            val buf = codec.getInputBuffer(inIdx)!!
++                            val size = extractor.readSampleData(buf, 0)
++                            if (size < 0) {
++                                codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
++                                inputDone = true
++                            } else {
++                                codec.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
++                                extractor.advance()
++                            }
++                        }
++                    }
++
++                    val outIdx = codec.dequeueOutputBuffer(info, 10_000)
++                    if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++                        val f = codec.outputFormat
++                        channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
++                        resampler.setSourceRate(f.getInteger(MediaFormat.KEY_SAMPLE_RATE))
++                        encoding = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING))
++                            f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AudioFormat.ENCODING_PCM_16BIT
++                    } else if (outIdx >= 0) {
++                        val buf = codec.getOutputBuffer(outIdx)!!
++                        buf.position(info.offset)
++                        buf.limit(info.offset + info.size)
++                        buf.order(ByteOrder.LITTLE_ENDIAN)
++
++                        // 채널 평균으로 모노 다운믹스 후 16kHz로 리샘플링
++                        if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
++                            val fb = buf.asFloatBuffer()
++                            repeat(fb.remaining() / channels) {
++                                var sum = 0f
++                                repeat(channels) { sum += fb.get() }
++                                resampler.push(sum / channels, writer)
++                            }
++                        } else {
++                            val sb = buf.asShortBuffer()
++                            repeat(sb.remaining() / channels) {
++                                var sum = 0f
++                                repeat(channels) { sum += sb.get() / 32768f }
++                                resampler.push(sum / channels, writer)
++                            }
++                        }
++                        codec.releaseOutputBuffer(outIdx, false)
++
++                        if (durationUs > 0) {
++                            val p = (info.presentationTimeUs * 100 / durationUs).toInt().coerceIn(0, 100)
++                            if (p != lastPercent) { lastPercent = p; onProgress(p) }
++                        }
++                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
++                    }
++                }
++                writer.flush()
++                writer.count
++            }
++        } finally {
++            codec.stop()
++            codec.release()
++            extractor.release()
++        }
++    }
++
++    /** PCM 임시 파일에서 [startSample]부터 [count]개 샘플을 -1.0~1.0 Float로 읽는다. */
++    fun readChunk(file: File, startSample: Long, count: Int): FloatArray {
++        val bytes = ByteArray(count * 2)
++        RandomAccessFile(file, "r").use { raf ->
++            raf.seek(startSample * 2)
++            raf.readFully(bytes)
++        }
++        return FloatArray(count) { i ->
++            val lo = bytes[i * 2].toInt() and 0xFF
++            val hi = bytes[i * 2 + 1].toInt()
++            ((hi shl 8) or lo).toShort() / 32768f
++        }
++    }
++}
++
++/** 선형 보간 리샘플러. 음성 인식용으로 충분한 단순 구현(저역 통과 필터 없음). */
++private class LinearResampler(private val dstRate: Int) {
++    private var step = 1.0   // 출력 1샘플당 진행하는 원본 샘플 수
++    private var pos = 0.0    // 직전 원본 샘플 기준 다음 출력 위치
++    private var prev = 0f
++    private var hasPrev = false
++
++    fun setSourceRate(srcRate: Int) { step = srcRate.toDouble() / dstRate }
++
++    fun push(sample: Float, out: PcmWriter) {
++        if (!hasPrev) { prev = sample; hasPrev = true; return }
++        while (pos < 1.0) {
++            out.add(prev + (sample - prev) * pos.toFloat())
++            pos += step
++        }
++        pos -= 1.0
++        prev = sample
++    }
++}
++
++/** Float 샘플을 16bit little-endian PCM으로 기록한다. */
++private class PcmWriter(private val out: OutputStream) {
++    private val bytes = ByteArray(32 * 1024)
++    private var n = 0
++    var count = 0L
++        private set
++
++    fun add(s: Float) {
++        val v = (s.coerceIn(-1f, 1f) * 32767f).toInt()
++        bytes[n++] = (v and 0xFF).toByte()
++        bytes[n++] = ((v shr 8) and 0xFF).toByte()
++        count++
++        if (n == bytes.size) flush()
++    }
++
++    fun flush() { out.write(bytes, 0, n); n = 0 }
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
+new file mode 100644
+index 0000000..1574ab5
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
+@@ -0,0 +1,19 @@
++package com.whispercppdemo.subtitle
++
++import com.whispercpp.whisper.WhisperSegment
++import java.util.Locale
++
++object SrtWriter {
++    fun toSrt(segments: List<WhisperSegment>): String = buildString {
++        segments.filter { it.text.isNotBlank() }.forEachIndexed { i, s ->
++            append(i + 1).append('\n')
++            append(ts(s.startMs)).append(" --> ").append(ts(s.endMs)).append('\n')
++            append(s.text.trim()).append("\n\n")
++        }
++    }
++
++    private fun ts(ms: Long) = String.format(
++        Locale.US, "%02d:%02d:%02d,%03d",
++        ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000
++    )
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
+new file mode 100644
+index 0000000..8253b2a
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
+@@ -0,0 +1,44 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import android.net.Uri
++import com.whispercpp.whisper.WhisperContext
++import com.whispercpp.whisper.WhisperSegment
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import java.io.File
++
++/** 영상 → 16kHz PCM → 구간별 인식 → SRT 문자열 */
++class SubtitlePipeline(private val context: Context, private val whisper: WhisperContext) {
++
++    suspend fun run(
++        videoUri: Uri,
++        language: String,
++        chunkMinutes: Int = 10,
++        onStatus: (String) -> Unit
++    ): String = withContext(Dispatchers.IO) {
++        val pcm = File(context.cacheDir, "audio_16k.pcm")
++        try {
++            val total = AudioDecoder.decodeToPcm16k(context, videoUri, pcm) { onStatus("오디오 추출 $it%") }
++            val rate = AudioDecoder.TARGET_RATE
++            val chunk = rate.toLong() * 60 * chunkMinutes
++            val totalMs = total * 1000 / rate
++            val segments = mutableListOf<WhisperSegment>()
++
++            var start = 0L
++            while (start < total) {
++                val n = minOf(chunk, total - start).toInt()
++                val offsetMs = start * 1000 / rate
++                onStatus("인식 중 ${hms(offsetMs)} / ${hms(totalMs)}")
++                whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language)
++                    .mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
++                start += n
++            }
++            SrtWriter.toSrt(segments)
++        } finally {
++            pcm.delete()
++        }
++    }
++
++    private fun hms(ms: Long) = "%d:%02d:%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
+new file mode 100644
+index 0000000..27ea3b1
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
+@@ -0,0 +1,46 @@
++package com.whispercppdemo.subtitle
++
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.Button
++import androidx.compose.material3.RadioButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++
++@Composable
++fun SubtitleScreen(vm: SubtitleViewModel) {
++    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        uri?.let(vm::transcribe)
++    }
++    val saveSrt = rememberLauncherForActivityResult(
++        ActivityResultContracts.CreateDocument("application/x-subrip")
++    ) { uri -> uri?.let(vm::save) }
++
++    Column(
++        Modifier.fillMaxSize().padding(16.dp),
++        verticalArrangement = Arrangement.spacedBy(12.dp)
++    ) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text("음성 언어")
++            listOf("en" to "영어", "ja" to "일본어").forEach { (code, label) ->
++                RadioButton(selected = vm.language == code, onClick = { vm.language = code }, enabled = !vm.busy)
++                Text(label)
++            }
++        }
++        Button(onClick = { pickVideo.launch(arrayOf("video/*")) }, enabled = !vm.busy) {
++            Text("영상 선택 → 자막 생성")
++        }
++        Button(onClick = { saveSrt.launch("subtitle.srt") }, enabled = !vm.busy && vm.lastSrt != null) {
++            Text("SRT 저장")
++        }
++        Text(vm.status)
++    }
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
+new file mode 100644
+index 0000000..0398b52
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
+@@ -0,0 +1,68 @@
++package com.whispercppdemo.subtitle
++
++import android.app.Application
++import android.net.Uri
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.lifecycle.AndroidViewModel
++import androidx.lifecycle.viewModelScope
++import com.whispercpp.whisper.WhisperContext
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++
++class SubtitleViewModel(private val app: Application) : AndroidViewModel(app) {
++    var status by mutableStateOf("모델 불러오는 중...")
++        private set
++    var busy by mutableStateOf(true)
++        private set
++    var language by mutableStateOf("en")
++    var lastSrt by mutableStateOf<String?>(null)
++        private set
++
++    private var whisper: WhisperContext? = null
++
++    init {
++        viewModelScope.launch(Dispatchers.IO) {
++            val model = app.assets.list("models")?.firstOrNull()
++            if (model == null) {
++                status = "app/src/main/assets/models 폴더에 모델 파일이 없습니다"
++                return@launch
++            }
++            whisper = WhisperContext.createContextFromAsset(app.assets, "models/$model")
++            status = "준비 완료 (모델: $model)"
++            busy = false
++        }
++    }
++
++    fun transcribe(videoUri: Uri) {
++        val ctx = whisper ?: return
++        busy = true
++        lastSrt = null
++        viewModelScope.launch {
++            val started = System.currentTimeMillis()
++            try {
++                lastSrt = SubtitlePipeline(app, ctx).run(videoUri, language) { status = it }
++                val sec = (System.currentTimeMillis() - started) / 1000
++                status = "완료 — 처리 시간 ${sec / 60}분 ${sec % 60}초. [SRT 저장]을 누르세요"
++            } catch (e: Exception) {
++                status = "오류: ${e.message}"
++            } finally {
++                busy = false
++            }
++        }
++    }
++
++    fun save(uri: Uri) {
++        val srt = lastSrt ?: return
++        viewModelScope.launch(Dispatchers.IO) {
++            app.contentResolver.openOutputStream(uri)?.use { it.write(srt.toByteArray(Charsets.UTF_8)) }
++            status = "저장 완료"
++        }
++    }
++
++    override fun onCleared() {
++        runBlocking { whisper?.release() }
++    }
++}
+diff --git a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
+index 37ae0e9..b21b4f8 100644
+--- a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
++++ b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
+@@ -10,6 +10,9 @@ import java.util.concurrent.Executors
+ 
+ private const val LOG_TAG = "LibWhisper"
+ 
++/** 인식 결과 한 구간. 시간 단위는 밀리초. */
++data class WhisperSegment(val startMs: Long, val endMs: Long, val text: String)
++
+ class WhisperContext private constructor(private var ptr: Long) {
+     // Meet Whisper C++ constraint: Don't access from more than one thread at a time.
+     private val scope: CoroutineScope = CoroutineScope(
+@@ -20,7 +23,7 @@ class WhisperContext private constructor(private var ptr: Long) {
+         require(ptr != 0L)
+         val numThreads = WhisperCpuConfig.preferredThreadCount
+         Log.d(LOG_TAG, "Selecting $numThreads threads")
+-        WhisperLib.fullTranscribe(ptr, numThreads, data)
++        WhisperLib.fullTranscribe(ptr, numThreads, data, "en")
+         val textCount = WhisperLib.getTextSegmentCount(ptr)
+         return@withContext buildString {
+             for (i in 0 until textCount) {
+@@ -35,6 +38,22 @@ class WhisperContext private constructor(private var ptr: Long) {
+         }
+     }
+ 
++    /** [language]: "en", "ja" 등. 구간별 타임스탬프(ms)와 텍스트를 반환한다. */
++    suspend fun transcribeSegments(data: FloatArray, language: String): List<WhisperSegment> =
++        withContext(scope.coroutineContext) {
++            require(ptr != 0L)
++            WhisperLib.fullTranscribe(ptr, WhisperCpuConfig.preferredThreadCount, data, language)
++            val count = WhisperLib.getTextSegmentCount(ptr)
++            List(count) { i ->
++                WhisperSegment(
++                    // whisper.cpp의 t0/t1은 10ms 단위
++                    startMs = WhisperLib.getTextSegmentT0(ptr, i) * 10,
++                    endMs = WhisperLib.getTextSegmentT1(ptr, i) * 10,
++                    text = WhisperLib.getTextSegment(ptr, i).trim()
++                )
++            }
++        }
++
+     suspend fun benchMemory(nthreads: Int): String = withContext(scope.coroutineContext) {
+         return@withContext WhisperLib.benchMemcpy(nthreads)
+     }
+@@ -134,7 +153,7 @@ private class WhisperLib {
+         external fun initContextFromAsset(assetManager: AssetManager, assetPath: String): Long
+         external fun initContext(modelPath: String): Long
+         external fun freeContext(contextPtr: Long)
+-        external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray)
++        external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray, language: String)
+         external fun getTextSegmentCount(contextPtr: Long): Int
+         external fun getTextSegment(contextPtr: Long, index: Int): String
+         external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
+diff --git a/examples/whisper.android/lib/src/main/jni/whisper/jni.c b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
+index da54c81..9bcd03c 100644
+--- a/examples/whisper.android/lib/src/main/jni/whisper/jni.c
++++ b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
+@@ -163,9 +163,10 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
+ 
+ JNIEXPORT void JNICALL
+ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+-        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data) {
++        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data, jstring language) {
+     UNUSED(thiz);
+     struct whisper_context *context = (struct whisper_context *) context_ptr;
++    const char *lang = (*env)->GetStringUTFChars(env, language, NULL);
+     jfloat *audio_data_arr = (*env)->GetFloatArrayElements(env, audio_data, NULL);
+     const jsize audio_data_length = (*env)->GetArrayLength(env, audio_data);
+ 
+@@ -176,7 +177,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+     params.print_timestamps = true;
+     params.print_special = false;
+     params.translate = false;
+-    params.language = "en";
++    params.language = lang; // "en", "ja" 등 Kotlin에서 전달
+     params.n_threads = num_threads;
+     params.offset_ms = 0;
+     params.no_context = true;
+@@ -191,6 +192,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+         whisper_print_timings(context);
+     }
+     (*env)->ReleaseFloatArrayElements(env, audio_data, audio_data_arr, JNI_ABORT);
++    (*env)->ReleaseStringUTFChars(env, language, lang);
+ }
+ 
+ JNIEXPORT jint JNICALL
