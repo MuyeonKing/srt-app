@@ -1,0 +1,60 @@
+name: Build SRT app
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "모델 (base 또는 small)"
+        default: "base"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      WHISPER_SHA: 0c7be696371069e0baa2515ed7aa08d5a5473aa6
+      MODEL: ${{ inputs.model || 'base' }}
+
+    steps:
+      - name: Checkout this repo (patch)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Get whisper.cpp (pinned commit)
+        run: |
+          git init whisper
+          cd whisper
+          git remote add origin https://github.com/ggml-org/whisper.cpp.git
+          git fetch --depth 1 origin "$WHISPER_SHA"
+          git checkout FETCH_HEAD
+
+      - name: Apply patch
+        run: git -C whisper apply ../mine/srt-app.patch
+
+      - name: Download model
+        run: |
+          mkdir -p whisper/examples/whisper.android/app/src/main/assets/models
+          curl -L --fail -o "whisper/examples/whisper.android/app/src/main/assets/models/ggml-$MODEL.bin" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$MODEL.bin"
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build APK
+        run: |
+          cd whisper/examples/whisper.android
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: srt-app-${{ env.MODEL }}
+          path: whisper/examples/whisper.android/app/build/outputs/apk/release/*.apk
