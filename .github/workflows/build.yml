@@ -38,6 +38,12 @@ jobs:
           curl -L --fail -o "whisper/examples/whisper.android/app/src/main/assets/models/ggml-$MODEL.bin" \
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$MODEL.bin"
 
+      - name: Download VAD model
+        run: |
+          mkdir -p whisper/examples/whisper.android/app/src/main/assets/vad
+          curl -L --fail -o whisper/examples/whisper.android/app/src/main/assets/vad/ggml-silero-v6.2.0.bin \
+            "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin"
+
       - name: Install Java
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
