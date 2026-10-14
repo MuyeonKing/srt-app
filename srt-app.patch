@@ -237,10 +237,10 @@ index 0000000..9a2337f
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 new file mode 100644
-index 0000000..e6d8e38
+index 0000000..4f3b9c3
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,18 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.compose.runtime.getValue
@@ -250,9 +250,15 @@ index 0000000..e6d8e38
 +/** 서비스(백그라운드 작업)와 화면이 함께 보는 작업 상태 */
 +object JobState {
 +    var status by mutableStateOf("모델 불러오는 중...")
-+    var busy by mutableStateOf(true)
++    var busy by mutableStateOf(true)        // 모델 로딩 또는 작업 중
++    var running by mutableStateOf(false)    // 자막 생성 작업 중 (취소 가능)
 +    var lastSrt by mutableStateOf<String?>(null)
++
++    @Volatile
++    var cancelRequested = false
 +}
++
++class CancelledByUser : Exception("사용자가 취소함")
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
 index 0000000..fe5529a
@@ -287,10 +293,10 @@ index 0000000..fe5529a
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..8253b2a
+index 0000000..27d82b1
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,74 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -298,6 +304,10 @@ index 0000000..8253b2a
 +import com.whispercpp.whisper.WhisperContext
 +import com.whispercpp.whisper.WhisperSegment
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
 +import kotlinx.coroutines.withContext
 +import java.io.File
 +
@@ -312,7 +322,10 @@ index 0000000..8253b2a
 +    ): String = withContext(Dispatchers.IO) {
 +        val pcm = File(context.cacheDir, "audio_16k.pcm")
 +        try {
-+            val total = AudioDecoder.decodeToPcm16k(context, videoUri, pcm) { onStatus("오디오 추출 $it%") }
++            val total = AudioDecoder.decodeToPcm16k(context, videoUri, pcm) {
++                checkCancel()
++                onStatus("오디오 추출 $it%")
++            }
 +            val rate = AudioDecoder.TARGET_RATE
 +            val chunk = rate.toLong() * 60 * chunkMinutes
 +            val totalMs = total * 1000 / rate
@@ -320,11 +333,30 @@ index 0000000..8253b2a
 +
 +            var start = 0L
 +            while (start < total) {
++                checkCancel()
 +                val n = minOf(chunk, total - start).toInt()
 +                val offsetMs = start * 1000 / rate
-+                onStatus("인식 중 ${hms(offsetMs)} / ${hms(totalMs)}")
-+                whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language)
-+                    .mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
++                val chunkMs = n.toLong() * 1000 / rate
++
++                val result = coroutineScope {
++                    // 인식 진행률을 1초마다 읽어 전체 기준 시간으로 표시
++                    onStatus("인식 중 ${hms(offsetMs)} / ${hms(totalMs)} (${if (totalMs > 0) offsetMs * 100 / totalMs else 0}%)")
++                    val poller = launch {
++                        while (isActive) {
++                            delay(1000) // 새 구간 시작 시 진행률이 0으로 초기화된 뒤 읽기
++                            val doneMs = offsetMs + chunkMs * WhisperContext.currentProgress() / 100
++                            val pct = if (totalMs > 0) doneMs * 100 / totalMs else 0
++                            onStatus("인식 중 ${hms(doneMs)} / ${hms(totalMs)} ($pct%)")
++                        }
++                    }
++                    try {
++                        whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language)
++                    } finally {
++                        poller.cancel()
++                    }
++                }
++                checkCancel() // 인식 도중 취소된 경우 결과를 버림
++                result.mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
 +                start += n
 +            }
 +            SrtWriter.toSrt(segments)
@@ -333,14 +365,18 @@ index 0000000..8253b2a
 +        }
 +    }
 +
++    private fun checkCancel() {
++        if (JobState.cancelRequested) throw CancelledByUser()
++    }
++
 +    private fun hms(ms: Long) = "%d:%02d:%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..d920a54
+index 0000000..32b5746
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,61 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.activity.compose.rememberLauncherForActivityResult
@@ -384,13 +420,16 @@ index 0000000..d920a54
 +    ) {
 +        Row(verticalAlignment = Alignment.CenterVertically) {
 +            Text("음성 언어")
-+            listOf("en" to "영어", "ja" to "일본어").forEach { (code, label) ->
-+                RadioButton(selected = vm.language == code, onClick = { vm.language = code }, enabled = !vm.busy)
++            listOf("ja" to "일본어", "en" to "영어").forEach { (code, label) ->
++                RadioButton(selected = vm.language == code, onClick = { vm.selectLanguage(code) }, enabled = !vm.busy)
 +                Text(label)
 +            }
 +        }
 +        Button(onClick = { pickVideo.launch(arrayOf("video/*")) }, enabled = !vm.busy) {
 +            Text("영상 선택 → 자막 생성")
++        }
++        Button(onClick = { vm.cancel() }, enabled = vm.running) {
++            Text("취소")
 +        }
 +        Button(onClick = { saveSrt.launch("subtitle.srt") }, enabled = !vm.busy && vm.lastSrt != null) {
 +            Text("SRT 저장")
@@ -401,10 +440,10 @@ index 0000000..d920a54
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..e7b62e6
+index 0000000..3fa3f06
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,221 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -416,6 +455,7 @@ index 0000000..e7b62e6
 +import android.content.Context
 +import android.content.Intent
 +import android.content.pm.ServiceInfo
++import android.graphics.drawable.Icon
 +import android.net.Uri
 +import android.os.Build
 +import android.os.Environment
@@ -423,6 +463,7 @@ index 0000000..e7b62e6
 +import android.os.PowerManager
 +import android.provider.MediaStore
 +import android.provider.OpenableColumns
++import com.whispercpp.whisper.WhisperContext
 +import com.whispercppdemo.MainActivity
 +import kotlinx.coroutines.CoroutineScope
 +import kotlinx.coroutines.Dispatchers
@@ -444,10 +485,23 @@ index 0000000..e7b62e6
 +    override fun onBind(intent: Intent?): IBinder? = null
 +
 +    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_CANCEL) {
++            if (running) {
++                JobState.cancelRequested = true
++                WhisperContext.requestAbort()
++                update("취소하는 중...")
++            } else {
++                stopSelf()
++            }
++            return START_NOT_STICKY
++        }
++
 +        val uri = intent?.data
-+        val language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "en"
++        val language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "ja"
 +        if (uri == null || running) return START_NOT_STICKY
 +        running = true
++        JobState.cancelRequested = false
++        JobState.running = true
 +
 +        createChannels()
 +        val first = progressNotification("자막 생성 준비 중...")
@@ -479,11 +533,19 @@ index 0000000..e7b62e6
 +            JobState.status = "완료 — 처리 시간 $time" +
 +                (savedAs?.let { "\n자동 저장: Download/SRT/$it" } ?: "\n[SRT 저장]을 누르세요")
 +            notifyDone("자막 생성 완료 ($time)", savedAs?.let { "Download/SRT/$it" } ?: videoName)
++        } catch (e: CancelledByUser) {
++            JobState.status = "취소됨"
 +        } catch (e: Exception) {
-+            JobState.status = "오류: ${e.message}"
-+            notifyDone("자막 생성 실패", e.message ?: "알 수 없는 오류")
++            if (JobState.cancelRequested) {
++                JobState.status = "취소됨"
++            } else {
++                JobState.status = "오류: ${e.message}"
++                notifyDone("자막 생성 실패", e.message ?: "알 수 없는 오류")
++            }
 +        } finally {
 +            JobState.busy = false
++            JobState.running = false
++            JobState.cancelRequested = false
 +            wakeLock?.let { if (it.isHeld) it.release() }
 +            stopForeground(STOP_FOREGROUND_REMOVE)
 +            stopSelf()
@@ -550,6 +612,17 @@ index 0000000..e7b62e6
 +            .setOngoing(true)
 +            .setOnlyAlertOnce(true)
 +            .setContentIntent(openAppIntent())
++            .addAction(
++                Notification.Action.Builder(
++                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
++                    "취소",
++                    PendingIntent.getService(
++                        this, 1,
++                        Intent(this, SubtitleService::class.java).setAction(ACTION_CANCEL),
++                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++                    )
++                ).build()
++            )
 +            .build()
 +
 +    private fun notifyDone(title: String, text: String) {
@@ -573,6 +646,7 @@ index 0000000..e7b62e6
 +
 +    companion object {
 +        const val EXTRA_LANGUAGE = "language"
++        const val ACTION_CANCEL = "com.whispercppdemo.subtitle.CANCEL"
 +        private const val CH_PROGRESS = "progress"
 +        private const val CH_DONE = "done"
 +        private const val ID_PROGRESS = 1
@@ -585,17 +659,22 @@ index 0000000..e7b62e6
 +                .putExtra(EXTRA_LANGUAGE, language)
 +            context.startForegroundService(intent)
 +        }
++
++        fun cancel(context: Context) {
++            context.startService(Intent(context, SubtitleService::class.java).setAction(ACTION_CANCEL))
++        }
 +    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..0f0027c
+index 0000000..969ba08
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,71 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
++import android.content.Context
 +import android.content.Intent
 +import android.net.Uri
 +import androidx.compose.runtime.getValue
@@ -610,7 +689,22 @@ index 0000000..0f0027c
 +    val status get() = JobState.status
 +    val busy get() = JobState.busy
 +    val lastSrt get() = JobState.lastSrt
-+    var language by mutableStateOf("en")
++    val running get() = JobState.running
++
++    // 선택한 언어를 기기에 저장 (기본: 일본어)
++    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
++    var language by mutableStateOf(prefs.getString("language", "ja") ?: "ja")
++        private set
++
++    fun selectLanguage(code: String) {
++        language = code
++        prefs.edit().putString("language", code).apply()
++    }
++
++    fun cancel() {
++        JobState.status = "취소하는 중..."
++        SubtitleService.cancel(app)
++    }
 +
 +    init {
 +        // 작업이 이미 진행 중(앱을 다시 연 경우)이면 상태를 건드리지 않는다
@@ -634,6 +728,7 @@ index 0000000..0f0027c
 +            // 영구 권한을 줄 수 없는 경로여도 실행 중에는 읽을 수 있으므로 계속 진행
 +        }
 +        JobState.busy = true
++        JobState.running = true
 +        JobState.lastSrt = null
 +        JobState.status = "시작 중... (알림창에서 진행 상황 확인 가능)"
 +        SubtitleService.start(app, videoUri, language)
@@ -690,7 +785,7 @@ index 40804ec..1b83417 100644
  </resources>
 \ No newline at end of file
 diff --git a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
-index 37ae0e9..b21b4f8 100644
+index 37ae0e9..cd55e2c 100644
 --- a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
 +++ b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
 @@ -10,6 +10,9 @@ import java.util.concurrent.Executors
@@ -735,7 +830,20 @@ index 37ae0e9..b21b4f8 100644
      suspend fun benchMemory(nthreads: Int): String = withContext(scope.coroutineContext) {
          return@withContext WhisperLib.benchMemcpy(nthreads)
      }
-@@ -134,7 +153,7 @@ private class WhisperLib {
+@@ -86,6 +105,12 @@ class WhisperContext private constructor(private var ptr: Long) {
+         fun getSystemInfo(): String {
+             return WhisperLib.getSystemInfo()
+         }
++
++        /** 현재 인식 중인 구간의 진행률 (0~100) */
++        fun currentProgress(): Int = WhisperLib.getProgress()
++
++        /** 진행 중인 인식을 중단 요청 */
++        fun requestAbort() = WhisperLib.requestAbort()
+     }
+ }
+ 
+@@ -134,12 +159,14 @@ private class WhisperLib {
          external fun initContextFromAsset(assetManager: AssetManager, assetPath: String): Long
          external fun initContext(modelPath: String): Long
          external fun freeContext(contextPtr: Long)
@@ -744,12 +852,49 @@ index 37ae0e9..b21b4f8 100644
          external fun getTextSegmentCount(contextPtr: Long): Int
          external fun getTextSegment(contextPtr: Long, index: Int): String
          external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
+         external fun getTextSegmentT1(contextPtr: Long, index: Int): Long
+         external fun getSystemInfo(): String
++        external fun getProgress(): Int
++        external fun requestAbort()
+         external fun benchMemcpy(nthread: Int): String
+         external fun benchGgmlMulMat(nthread: Int): String
+     }
 diff --git a/examples/whisper.android/lib/src/main/jni/whisper/jni.c b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
-index da54c81..4036828 100644
+index da54c81..4874397 100644
 --- a/examples/whisper.android/lib/src/main/jni/whisper/jni.c
 +++ b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
-@@ -163,9 +163,10 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
+@@ -161,11 +161,40 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
+     whisper_free(context);
+ }
  
++// 진행률/취소 상태 (컨텍스트는 앱에서 하나만 사용)
++static volatile int g_progress = 0;
++static volatile int g_abort = 0;
++
++static void on_progress(struct whisper_context *ctx, struct whisper_state *state, int progress, void *user_data) {
++    (void) ctx; (void) state; (void) user_data;
++    g_progress = progress;
++}
++
++static bool on_abort(void *user_data) {
++    (void) user_data;
++    return g_abort != 0;
++}
++
++JNIEXPORT jint JNICALL
++Java_com_whispercpp_whisper_WhisperLib_00024Companion_getProgress(JNIEnv *env, jobject thiz) {
++    UNUSED(env);
++    UNUSED(thiz);
++    return g_progress;
++}
++
++JNIEXPORT void JNICALL
++Java_com_whispercpp_whisper_WhisperLib_00024Companion_requestAbort(JNIEnv *env, jobject thiz) {
++    UNUSED(env);
++    UNUSED(thiz);
++    g_abort = 1;
++}
++
  JNIEXPORT void JNICALL
  Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
 -        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data) {
@@ -760,7 +905,7 @@ index da54c81..4036828 100644
      jfloat *audio_data_arr = (*env)->GetFloatArrayElements(env, audio_data, NULL);
      const jsize audio_data_length = (*env)->GetArrayLength(env, audio_data);
  
-@@ -176,10 +177,11 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -176,10 +205,15 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
      params.print_timestamps = true;
      params.print_special = false;
      params.translate = false;
@@ -770,10 +915,14 @@ index da54c81..4036828 100644
      params.offset_ms = 0;
      params.no_context = true;
 +    params.suppress_nst = true; // (スタッフ) 같은 비음성 기호 출력 억제
++    g_progress = 0;
++    g_abort = 0;
++    params.progress_callback = on_progress;
++    params.abort_callback = on_abort;
      params.single_segment = false;
  
      whisper_reset_timings(context);
-@@ -191,6 +193,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -191,6 +225,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
          whisper_print_timings(context);
      }
      (*env)->ReleaseFloatArrayElements(env, audio_data, audio_data_arr, JNI_ABORT);
