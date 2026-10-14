@@ -6,14 +6,14 @@ on:
     inputs:
       model:
         description: "모델 (base 또는 small)"
-        default: "base"
+        default: "small"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     env:
       WHISPER_SHA: 0c7be696371069e0baa2515ed7aa08d5a5473aa6
-      MODEL: ${{ inputs.model || 'base' }}
+      MODEL: ${{ inputs.model || 'small' }}
 
     steps:
       - name: Checkout this repo (patch)
