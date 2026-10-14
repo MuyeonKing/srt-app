@@ -261,10 +261,10 @@ index 0000000..4f3b9c3
 +class CancelledByUser : Exception("사용자가 취소함")
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
-index 0000000..fe5529a
+index 0000000..bdad9d5
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,39 @@
 +package com.whispercppdemo.subtitle
 +
 +import com.whispercpp.whisper.WhisperSegment
@@ -276,9 +276,22 @@ index 0000000..fe5529a
 +
 +    private fun clean(text: String) = text.replace(tagPattern, " ").replace(Regex("\\s+"), " ").trim()
 +
++    /** 같은 문장이 연속 [limit]회 이상 나오면 인식 오류(반복 생성)로 보고 해당 구간을 제거 */
++    private fun dropLoops(list: List<WhisperSegment>, limit: Int = 5): List<WhisperSegment> {
++        val out = mutableListOf<WhisperSegment>()
++        var i = 0
++        while (i < list.size) {
++            var j = i
++            while (j + 1 < list.size && list[j + 1].text == list[i].text) j++
++            val runLength = j - i + 1
++            if (runLength < limit) out.addAll(list.subList(i, j + 1))
++            i = j + 1
++        }
++        return out
++    }
++
 +    fun toSrt(segments: List<WhisperSegment>): String = buildString {
-+        segments.map { it.copy(text = clean(it.text)) }
-+            .filter { it.text.isNotBlank() }
++        dropLoops(segments.map { it.copy(text = clean(it.text)) }.filter { it.text.isNotBlank() })
 +            .forEachIndexed { i, s ->
 +                append(i + 1).append('\n')
 +                append(ts(s.startMs)).append(" --> ").append(ts(s.endMs)).append('\n')
@@ -293,10 +306,10 @@ index 0000000..fe5529a
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..27d82b1
+index 0000000..601d9cc
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,84 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -317,19 +330,31 @@ index 0000000..27d82b1
 +    suspend fun run(
 +        videoUri: Uri,
 +        language: String,
++        vadModelPath: String?,
 +        chunkMinutes: Int = 10,
 +        onStatus: (String) -> Unit
 +    ): String = withContext(Dispatchers.IO) {
 +        val pcm = File(context.cacheDir, "audio_16k.pcm")
++        val jobStart = System.currentTimeMillis()
++        fun elapsed() = "경과 ${hms(System.currentTimeMillis() - jobStart)}"
 +        try {
 +            val total = AudioDecoder.decodeToPcm16k(context, videoUri, pcm) {
 +                checkCancel()
-+                onStatus("오디오 추출 $it%")
++                onStatus("오디오 추출 $it% · ${elapsed()}")
 +            }
 +            val rate = AudioDecoder.TARGET_RATE
 +            val chunk = rate.toLong() * 60 * chunkMinutes
 +            val totalMs = total * 1000 / rate
 +            val segments = mutableListOf<WhisperSegment>()
++            val recogStart = System.currentTimeMillis()
++
++            // 인식에 걸린 시간과 진행 위치로 남은 시간을 추정 (2% 이상 진행 후 표시)
++            fun line(doneMs: Long): String {
++                val pct = if (totalMs > 0) doneMs * 100 / totalMs else 0
++                val spent = System.currentTimeMillis() - recogStart
++                val eta = if (pct >= 2 && doneMs > 0) " · 남은 시간 약 ${hms(spent * (totalMs - doneMs) / doneMs)}" else ""
++                return "인식 중 ${hms(doneMs)} / ${hms(totalMs)} ($pct%)\n${elapsed()}$eta"
++            }
 +
 +            var start = 0L
 +            while (start < total) {
@@ -340,17 +365,15 @@ index 0000000..27d82b1
 +
 +                val result = coroutineScope {
 +                    // 인식 진행률을 1초마다 읽어 전체 기준 시간으로 표시
-+                    onStatus("인식 중 ${hms(offsetMs)} / ${hms(totalMs)} (${if (totalMs > 0) offsetMs * 100 / totalMs else 0}%)")
++                    onStatus(line(offsetMs))
 +                    val poller = launch {
 +                        while (isActive) {
 +                            delay(1000) // 새 구간 시작 시 진행률이 0으로 초기화된 뒤 읽기
-+                            val doneMs = offsetMs + chunkMs * WhisperContext.currentProgress() / 100
-+                            val pct = if (totalMs > 0) doneMs * 100 / totalMs else 0
-+                            onStatus("인식 중 ${hms(doneMs)} / ${hms(totalMs)} ($pct%)")
++                            onStatus(line(offsetMs + chunkMs * WhisperContext.currentProgress() / 100))
 +                        }
 +                    }
 +                    try {
-+                        whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language)
++                        whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language, vadModelPath)
 +                    } finally {
 +                        poller.cancel()
 +                    }
@@ -373,10 +396,10 @@ index 0000000..27d82b1
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..32b5746
+index 0000000..052ca62
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,66 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.activity.compose.rememberLauncherForActivityResult
@@ -389,6 +412,7 @@ index 0000000..32b5746
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.material3.Button
++import androidx.compose.material3.Checkbox
 +import androidx.compose.material3.RadioButton
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
@@ -425,6 +449,10 @@ index 0000000..32b5746
 +                Text(label)
 +            }
 +        }
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Checkbox(checked = vm.useVad, onCheckedChange = { vm.toggleVad(it) }, enabled = !vm.busy)
++            Text("목소리 없는 구간 건너뛰기 (VAD)")
++        }
 +        Button(onClick = { pickVideo.launch(arrayOf("video/*")) }, enabled = !vm.busy) {
 +            Text("영상 선택 → 자막 생성")
 +        }
@@ -440,10 +468,10 @@ index 0000000..32b5746
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..3fa3f06
+index 0000000..02fd9e3
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,226 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -481,6 +509,7 @@ index 0000000..3fa3f06
 +    private var wakeLock: PowerManager.WakeLock? = null
 +    private var lastShown = ""
 +    private var running = false
++    private var useVad = true
 +
 +    override fun onBind(intent: Intent?): IBinder? = null
 +
@@ -498,6 +527,7 @@ index 0000000..3fa3f06
 +
 +        val uri = intent?.data
 +        val language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "ja"
++        useVad = intent?.getBooleanExtra(EXTRA_VAD, true) ?: true
 +        if (uri == null || running) return START_NOT_STICKY
 +        running = true
 +        JobState.cancelRequested = false
@@ -525,7 +555,8 @@ index 0000000..3fa3f06
 +        val videoName = displayName(uri)
 +        try {
 +            val whisper = WhisperHolder.get(this)
-+            val srt = SubtitlePipeline(this, whisper).run(uri, language) { update(it) }
++            val vadPath = if (useVad) WhisperHolder.vadModelPath(this) else null
++            val srt = SubtitlePipeline(this, whisper).run(uri, language, vadPath) { update(it) }
 +            JobState.lastSrt = srt
 +            val savedAs = autoSave(videoName, srt)
 +            val sec = (System.currentTimeMillis() - started) / 1000
@@ -646,17 +677,19 @@ index 0000000..3fa3f06
 +
 +    companion object {
 +        const val EXTRA_LANGUAGE = "language"
++        const val EXTRA_VAD = "vad"
 +        const val ACTION_CANCEL = "com.whispercppdemo.subtitle.CANCEL"
 +        private const val CH_PROGRESS = "progress"
 +        private const val CH_DONE = "done"
 +        private const val ID_PROGRESS = 1
 +        private const val ID_DONE = 2
 +
-+        fun start(context: Context, uri: Uri, language: String) {
++        fun start(context: Context, uri: Uri, language: String, vad: Boolean) {
 +            val intent = Intent(context, SubtitleService::class.java)
 +                .setData(uri)
 +                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 +                .putExtra(EXTRA_LANGUAGE, language)
++                .putExtra(EXTRA_VAD, vad)
 +            context.startForegroundService(intent)
 +        }
 +
@@ -667,10 +700,10 @@ index 0000000..3fa3f06
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..969ba08
+index 0000000..69fdac0
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,80 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
@@ -699,6 +732,15 @@ index 0000000..969ba08
 +    fun selectLanguage(code: String) {
 +        language = code
 +        prefs.edit().putString("language", code).apply()
++    }
++
++    // VAD(비음성 구간 건너뛰기) 사용 여부 저장 (기본: 켜짐)
++    var useVad by mutableStateOf(prefs.getBoolean("vad", true))
++        private set
++
++    fun toggleVad(on: Boolean) {
++        useVad = on
++        prefs.edit().putBoolean("vad", on).apply()
 +    }
 +
 +    fun cancel() {
@@ -731,7 +773,7 @@ index 0000000..969ba08
 +        JobState.running = true
 +        JobState.lastSrt = null
 +        JobState.status = "시작 중... (알림창에서 진행 상황 확인 가능)"
-+        SubtitleService.start(app, videoUri, language)
++        SubtitleService.start(app, videoUri, language, useVad)
 +    }
 +
 +    fun save(uri: Uri) {
@@ -744,10 +786,10 @@ index 0000000..969ba08
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt
 new file mode 100644
-index 0000000..05b70dd
+index 0000000..228c8aa
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,38 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -756,6 +798,7 @@ index 0000000..05b70dd
 +import kotlinx.coroutines.sync.Mutex
 +import kotlinx.coroutines.sync.withLock
 +import kotlinx.coroutines.withContext
++import java.io.File
 +
 +/** 모델을 앱 전체에서 한 번만 불러와 재사용한다. */
 +object WhisperHolder {
@@ -773,6 +816,17 @@ index 0000000..05b70dd
 +            WhisperContext.createContextFromAsset(assets, "models/$model")
 +        }.also { ctx = it }
 +    }
++
++    /** assets/vad 의 VAD 모델을 앱 내부 폴더로 한 번 복사하고 경로를 반환 (없으면 null) */
++    fun vadModelPath(context: Context): String? {
++        val assets = context.applicationContext.assets
++        val name = assets.list("vad")?.firstOrNull() ?: return null
++        val file = File(context.filesDir, name)
++        if (!file.exists() || file.length() == 0L) {
++            assets.open("vad/$name").use { input -> file.outputStream().use { input.copyTo(it) } }
++        }
++        return file.absolutePath
++    }
 +}
 diff --git a/examples/whisper.android/app/src/main/res/values/strings.xml b/examples/whisper.android/app/src/main/res/values/strings.xml
 index 40804ec..1b83417 100644
@@ -785,7 +839,7 @@ index 40804ec..1b83417 100644
  </resources>
 \ No newline at end of file
 diff --git a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
-index 37ae0e9..cd55e2c 100644
+index 37ae0e9..81d972c 100644
 --- a/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
 +++ b/examples/whisper.android/lib/src/main/java/com/whispercpp/whisper/LibWhisper.kt
 @@ -10,6 +10,9 @@ import java.util.concurrent.Executors
@@ -803,19 +857,22 @@ index 37ae0e9..cd55e2c 100644
          val numThreads = WhisperCpuConfig.preferredThreadCount
          Log.d(LOG_TAG, "Selecting $numThreads threads")
 -        WhisperLib.fullTranscribe(ptr, numThreads, data)
-+        WhisperLib.fullTranscribe(ptr, numThreads, data, "en")
++        WhisperLib.fullTranscribe(ptr, numThreads, data, "en", null)
          val textCount = WhisperLib.getTextSegmentCount(ptr)
          return@withContext buildString {
              for (i in 0 until textCount) {
-@@ -35,6 +38,22 @@ class WhisperContext private constructor(private var ptr: Long) {
+@@ -35,6 +38,25 @@ class WhisperContext private constructor(private var ptr: Long) {
          }
      }
  
-+    /** [language]: "en", "ja" 등. 구간별 타임스탬프(ms)와 텍스트를 반환한다. */
-+    suspend fun transcribeSegments(data: FloatArray, language: String): List<WhisperSegment> =
++    /**
++     * [language]: "en", "ja" 등. [vadModelPath]가 있으면 VAD로 음성 구간만 인식한다.
++     * 구간별 타임스탬프(ms, 원본 기준)와 텍스트를 반환한다.
++     */
++    suspend fun transcribeSegments(data: FloatArray, language: String, vadModelPath: String? = null): List<WhisperSegment> =
 +        withContext(scope.coroutineContext) {
 +            require(ptr != 0L)
-+            WhisperLib.fullTranscribe(ptr, WhisperCpuConfig.preferredThreadCount, data, language)
++            WhisperLib.fullTranscribe(ptr, WhisperCpuConfig.preferredThreadCount, data, language, vadModelPath)
 +            val count = WhisperLib.getTextSegmentCount(ptr)
 +            List(count) { i ->
 +                WhisperSegment(
@@ -830,7 +887,7 @@ index 37ae0e9..cd55e2c 100644
      suspend fun benchMemory(nthreads: Int): String = withContext(scope.coroutineContext) {
          return@withContext WhisperLib.benchMemcpy(nthreads)
      }
-@@ -86,6 +105,12 @@ class WhisperContext private constructor(private var ptr: Long) {
+@@ -86,6 +108,12 @@ class WhisperContext private constructor(private var ptr: Long) {
          fun getSystemInfo(): String {
              return WhisperLib.getSystemInfo()
          }
@@ -843,12 +900,12 @@ index 37ae0e9..cd55e2c 100644
      }
  }
  
-@@ -134,12 +159,14 @@ private class WhisperLib {
+@@ -134,12 +162,14 @@ private class WhisperLib {
          external fun initContextFromAsset(assetManager: AssetManager, assetPath: String): Long
          external fun initContext(modelPath: String): Long
          external fun freeContext(contextPtr: Long)
 -        external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray)
-+        external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray, language: String)
++        external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray, language: String, vadModelPath: String?)
          external fun getTextSegmentCount(contextPtr: Long): Int
          external fun getTextSegment(contextPtr: Long, index: Int): String
          external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
@@ -860,10 +917,10 @@ index 37ae0e9..cd55e2c 100644
          external fun benchGgmlMulMat(nthread: Int): String
      }
 diff --git a/examples/whisper.android/lib/src/main/jni/whisper/jni.c b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
-index da54c81..4874397 100644
+index da54c81..3f12122 100644
 --- a/examples/whisper.android/lib/src/main/jni/whisper/jni.c
 +++ b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
-@@ -161,11 +161,40 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
+@@ -161,11 +161,41 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
      whisper_free(context);
  }
  
@@ -898,14 +955,15 @@ index da54c81..4874397 100644
  JNIEXPORT void JNICALL
  Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
 -        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data) {
-+        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data, jstring language) {
++        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data, jstring language, jstring vad_model_path) {
      UNUSED(thiz);
      struct whisper_context *context = (struct whisper_context *) context_ptr;
 +    const char *lang = (*env)->GetStringUTFChars(env, language, NULL);
++    const char *vad_path = vad_model_path != NULL ? (*env)->GetStringUTFChars(env, vad_model_path, NULL) : NULL;
      jfloat *audio_data_arr = (*env)->GetFloatArrayElements(env, audio_data, NULL);
      const jsize audio_data_length = (*env)->GetArrayLength(env, audio_data);
  
-@@ -176,10 +205,15 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -176,10 +206,20 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
      params.print_timestamps = true;
      params.print_special = false;
      params.translate = false;
@@ -919,14 +977,22 @@ index da54c81..4874397 100644
 +    g_abort = 0;
 +    params.progress_callback = on_progress;
 +    params.abort_callback = on_abort;
++    // VAD: 사람 목소리가 없는 구간은 인식하지 않음 (반복 생성 오류 방지, 속도 향상)
++    if (vad_path != NULL) {
++        params.vad = true;
++        params.vad_model_path = vad_path;
++    }
      params.single_segment = false;
  
      whisper_reset_timings(context);
-@@ -191,6 +225,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -191,6 +231,10 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
          whisper_print_timings(context);
      }
      (*env)->ReleaseFloatArrayElements(env, audio_data, audio_data_arr, JNI_ABORT);
 +    (*env)->ReleaseStringUTFChars(env, language, lang);
++    if (vad_path != NULL) {
++        (*env)->ReleaseStringUTFChars(env, vad_model_path, vad_path);
++    }
  }
  
  JNIEXPORT jint JNICALL
