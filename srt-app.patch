@@ -235,12 +235,95 @@ index 0000000..9a2337f
 +
 +    fun flush() { out.write(bytes, 0, n); n = 0 }
 +}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
+new file mode 100644
+index 0000000..b9eb306
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
+@@ -0,0 +1,77 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/** 처리 기록 한 건 */
++data class HistoryEntry(
++    val time: Long,          // 시작 시각
++    val name: String,        // 영상 파일 이름
++    val videoMs: Long,       // 영상 길이 (모르면 0)
++    val procMs: Long,        // 처리 시간
++    val model: String,
++    val vad: Boolean,
++    val lang: String,
++    val result: String,      // 완료 / 취소 / 오류
++    val count: Int           // 생성된 자막 수
++) {
++    fun summary(): String {
++        val date = SimpleDateFormat("MM/dd HH:mm", Locale.KOREA).format(Date(time))
++        val ratio = if (videoMs > 0) " (%.2f배)".format(procMs.toDouble() / videoMs) else ""
++        val video = if (videoMs > 0) "영상 ${hms(videoMs)} · " else ""
++        val langName = if (lang == "ja") "일본어" else "영어"
++        val countText = if (result == "완료") " · 자막 ${count}개" else ""
++        return "$date · $result · ${video}처리 ${hms(procMs)}$ratio\n" +
++            "$name · ${model.removePrefix("ggml-").removeSuffix(".bin")} · VAD ${if (vad) "켬" else "끔"} · $langName$countText"
++    }
++
++    private fun hms(ms: Long) = "%d:%02d:%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
++}
++
++/** 앱 내부(SharedPreferences)에 최근 30건을 보관 */
++object HistoryStore {
++    private const val PREFS = "history"
++    private const val KEY = "entries"
++    private const val MAX = 30
++
++    fun load(context: Context): List<HistoryEntry> {
++        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null) ?: return emptyList()
++        return try {
++            val arr = JSONArray(raw)
++            List(arr.length()) { i ->
++                val o = arr.getJSONObject(i)
++                HistoryEntry(
++                    o.getLong("time"), o.getString("name"), o.getLong("videoMs"), o.getLong("procMs"),
++                    o.getString("model"), o.getBoolean("vad"), o.getString("lang"),
++                    o.getString("result"), o.getInt("count")
++                )
++            }
++        } catch (e: Exception) {
++            emptyList()
++        }
++    }
++
++    /** 기록을 맨 앞에 추가하고 전체 목록을 반환 */
++    fun add(context: Context, e: HistoryEntry): List<HistoryEntry> {
++        val list = (listOf(e) + load(context)).take(MAX)
++        val arr = JSONArray()
++        list.forEach {
++            arr.put(
++                JSONObject()
++                    .put("time", it.time).put("name", it.name).put("videoMs", it.videoMs)
++                    .put("procMs", it.procMs).put("model", it.model).put("vad", it.vad)
++                    .put("lang", it.lang).put("result", it.result).put("count", it.count)
++            )
++        }
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, arr.toString()).apply()
++        return list
++    }
++
++    fun clear(context: Context) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
++    }
++}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 new file mode 100644
-index 0000000..4f3b9c3
+index 0000000..ed9d678
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,19 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.compose.runtime.getValue
@@ -253,6 +336,7 @@ index 0000000..4f3b9c3
 +    var busy by mutableStateOf(true)        // 모델 로딩 또는 작업 중
 +    var running by mutableStateOf(false)    // 자막 생성 작업 중 (취소 가능)
 +    var lastSrt by mutableStateOf<String?>(null)
++    var history by mutableStateOf<List<HistoryEntry>>(emptyList())
 +
 +    @Volatile
 +    var cancelRequested = false
@@ -261,16 +345,18 @@ index 0000000..4f3b9c3
 +class CancelledByUser : Exception("사용자가 취소함")
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
-index 0000000..bdad9d5
+index 0000000..8c0d407
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,43 @@
 +package com.whispercppdemo.subtitle
 +
 +import com.whispercpp.whisper.WhisperSegment
 +import java.util.Locale
 +
 +object SrtWriter {
++    private const val MAX_DURATION_MS = 7_000L
++
 +    // (スタッフ), （拍手）, [音楽] 같은 괄호 태그 제거
 +    private val tagPattern = Regex("""\([^)]*\)|（[^）]*）|\[[^\]]*]|【[^】]*】""")
 +
@@ -293,8 +379,10 @@ index 0000000..bdad9d5
 +    fun toSrt(segments: List<WhisperSegment>): String = buildString {
 +        dropLoops(segments.map { it.copy(text = clean(it.text)) }.filter { it.text.isNotBlank() })
 +            .forEachIndexed { i, s ->
++                // 자막 한 개의 표시 시간은 최대 7초 (Netflix 자막 가이드 기준)
++                val end = minOf(s.endMs, s.startMs + MAX_DURATION_MS)
 +                append(i + 1).append('\n')
-+                append(ts(s.startMs)).append(" --> ").append(ts(s.endMs)).append('\n')
++                append(ts(s.startMs)).append(" --> ").append(ts(end)).append('\n')
 +                append(s.text).append("\n\n")
 +            }
 +    }
@@ -306,10 +394,10 @@ index 0000000..bdad9d5
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..601d9cc
+index 0000000..723f867
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,88 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -326,6 +414,9 @@ index 0000000..601d9cc
 +
 +/** 영상 → 16kHz PCM → 구간별 인식 → SRT 문자열 */
 +class SubtitlePipeline(private val context: Context, private val whisper: WhisperContext) {
++    /** 오디오 추출 후 알게 된 영상 길이 (ms) */
++    var totalMs = 0L
++        private set
 +
 +    suspend fun run(
 +        videoUri: Uri,
@@ -345,6 +436,7 @@ index 0000000..601d9cc
 +            val rate = AudioDecoder.TARGET_RATE
 +            val chunk = rate.toLong() * 60 * chunkMinutes
 +            val totalMs = total * 1000 / rate
++            this@SubtitlePipeline.totalMs = totalMs
 +            val segments = mutableListOf<WhisperSegment>()
 +            val recogStart = System.currentTimeMillis()
 +
@@ -396,10 +488,10 @@ index 0000000..601d9cc
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..052ca62
+index 0000000..2ab0a5e
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,86 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.activity.compose.rememberLauncherForActivityResult
@@ -411,6 +503,11 @@ index 0000000..052ca62
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.Divider
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.TextButton
 +import androidx.compose.material3.Button
 +import androidx.compose.material3.Checkbox
 +import androidx.compose.material3.RadioButton
@@ -439,7 +536,7 @@ index 0000000..052ca62
 +    ) { uri -> uri?.let(vm::save) }
 +
 +    Column(
-+        Modifier.fillMaxSize().padding(16.dp),
++        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
 +        verticalArrangement = Arrangement.spacedBy(12.dp)
 +    ) {
 +        Row(verticalAlignment = Alignment.CenterVertically) {
@@ -464,14 +561,29 @@ index 0000000..052ca62
 +        }
 +        Text(vm.status)
 +        Text("작업 중에는 다른 앱을 쓰거나 화면을 꺼도 됩니다. 완료되면 알림이 뜹니다.")
++
++        Divider()
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text("처리 기록 (최근 30건)", style = MaterialTheme.typography.titleMedium)
++            TextButton(onClick = { vm.clearHistory() }, enabled = vm.history.isNotEmpty() && !vm.running) {
++                Text("기록 지우기")
++            }
++        }
++        if (vm.history.isEmpty()) {
++            Text("아직 기록이 없습니다.", style = MaterialTheme.typography.bodySmall)
++        }
++        vm.history.forEach { entry ->
++            Text(entry.summary(), style = MaterialTheme.typography.bodySmall)
++            Divider()
++        }
 +    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..02fd9e3
+index 0000000..00d239b
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,251 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -553,11 +665,17 @@ index 0000000..02fd9e3
 +    private suspend fun runJob(uri: Uri, language: String) {
 +        val started = System.currentTimeMillis()
 +        val videoName = displayName(uri)
++        var pipeline: SubtitlePipeline? = null
++        var result = "오류"
++        var count = 0
 +        try {
 +            val whisper = WhisperHolder.get(this)
 +            val vadPath = if (useVad) WhisperHolder.vadModelPath(this) else null
-+            val srt = SubtitlePipeline(this, whisper).run(uri, language, vadPath) { update(it) }
++            pipeline = SubtitlePipeline(this, whisper)
++            val srt = pipeline.run(uri, language, vadPath) { update(it) }
 +            JobState.lastSrt = srt
++            result = "완료"
++            count = Regex(" --> ").findAll(srt).count()
 +            val savedAs = autoSave(videoName, srt)
 +            val sec = (System.currentTimeMillis() - started) / 1000
 +            val time = "${sec / 60}분 ${sec % 60}초"
@@ -565,15 +683,34 @@ index 0000000..02fd9e3
 +                (savedAs?.let { "\n자동 저장: Download/SRT/$it" } ?: "\n[SRT 저장]을 누르세요")
 +            notifyDone("자막 생성 완료 ($time)", savedAs?.let { "Download/SRT/$it" } ?: videoName)
 +        } catch (e: CancelledByUser) {
++            result = "취소"
 +            JobState.status = "취소됨"
 +        } catch (e: Exception) {
 +            if (JobState.cancelRequested) {
++                result = "취소"
 +                JobState.status = "취소됨"
 +            } else {
 +                JobState.status = "오류: ${e.message}"
 +                notifyDone("자막 생성 실패", e.message ?: "알 수 없는 오류")
 +            }
 +        } finally {
++            try {
++                JobState.history = HistoryStore.add(
++                    this,
++                    HistoryEntry(
++                        time = started,
++                        name = videoName,
++                        videoMs = pipeline?.totalMs ?: 0L,
++                        procMs = System.currentTimeMillis() - started,
++                        model = WhisperHolder.modelName ?: "?",
++                        vad = useVad,
++                        lang = language,
++                        result = result,
++                        count = count
++                    )
++                )
++            } catch (_: Exception) {
++            }
 +            JobState.busy = false
 +            JobState.running = false
 +            JobState.cancelRequested = false
@@ -700,10 +837,10 @@ index 0000000..02fd9e3
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..69fdac0
+index 0000000..6b80572
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,88 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
@@ -748,7 +885,15 @@ index 0000000..69fdac0
 +        SubtitleService.cancel(app)
 +    }
 +
++    val history get() = JobState.history
++
++    fun clearHistory() {
++        HistoryStore.clear(app)
++        JobState.history = emptyList()
++    }
++
 +    init {
++        if (JobState.history.isEmpty()) JobState.history = HistoryStore.load(app)
 +        // 작업이 이미 진행 중(앱을 다시 연 경우)이면 상태를 건드리지 않는다
 +        if (JobState.lastSrt == null && JobState.status.startsWith("모델")) {
 +            viewModelScope.launch {
@@ -917,7 +1062,7 @@ index 37ae0e9..81d972c 100644
          external fun benchGgmlMulMat(nthread: Int): String
      }
 diff --git a/examples/whisper.android/lib/src/main/jni/whisper/jni.c b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
-index da54c81..3f12122 100644
+index da54c81..102eafe 100644
 --- a/examples/whisper.android/lib/src/main/jni/whisper/jni.c
 +++ b/examples/whisper.android/lib/src/main/jni/whisper/jni.c
 @@ -161,11 +161,41 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
@@ -963,7 +1108,7 @@ index da54c81..3f12122 100644
      jfloat *audio_data_arr = (*env)->GetFloatArrayElements(env, audio_data, NULL);
      const jsize audio_data_length = (*env)->GetArrayLength(env, audio_data);
  
-@@ -176,10 +206,20 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -176,10 +206,30 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
      params.print_timestamps = true;
      params.print_special = false;
      params.translate = false;
@@ -973,6 +1118,13 @@ index da54c81..3f12122 100644
      params.offset_ms = 0;
      params.no_context = true;
 +    params.suppress_nst = true; // (スタッフ) 같은 비음성 기호 출력 억제
++    // 이전 30초 구간의 인식 결과를 다음 구간의 힌트로 쓰지 않음
++    // (한 번 반복 오류에 빠지면 구간 끝까지 이어지는 현상 방지)
++    params.n_max_text_ctx = 0;
++    // 단어(토큰) 단위 타임스탬프로 자막을 최대 25글자씩 나눔 → 주고받는 대화가 한 자막으로 묶이지 않게
++    params.token_timestamps = true;
++    params.max_len = 25;
++    params.split_on_word = false; // 일본어는 띄어쓰기가 없어 토큰 단위로 분할
 +    g_progress = 0;
 +    g_abort = 0;
 +    params.progress_callback = on_progress;
@@ -981,11 +1133,14 @@ index da54c81..3f12122 100644
 +    if (vad_path != NULL) {
 +        params.vad = true;
 +        params.vad_model_path = vad_path;
++        // 작은 목소리·짧은 대사도 음성으로 인정하고, 말의 앞뒤가 잘리지 않게 여유를 둠
++        params.vad_params.threshold = 0.35f;       // 기본 0.5
++        params.vad_params.speech_pad_ms = 200;     // 기본 30
 +    }
      params.single_segment = false;
  
      whisper_reset_timings(context);
-@@ -191,6 +231,10 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
+@@ -191,6 +241,10 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
          whisper_print_timings(context);
      }
      (*env)->ReleaseFloatArrayElements(env, audio_data, audio_data_arr, JNI_ABORT);
