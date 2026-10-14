@@ -5,15 +5,15 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "모델 (base 또는 small)"
-        default: "small"
+        description: "모델 (small, large-v3-turbo-q5_0 등)"
+        default: "large-v3-turbo-q5_0"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     env:
       WHISPER_SHA: 0c7be696371069e0baa2515ed7aa08d5a5473aa6
-      MODEL: ${{ inputs.model || 'small' }}
+      MODEL: ${{ inputs.model || 'large-v3-turbo-q5_0' }}
 
     steps:
       - name: Checkout this repo (patch)
