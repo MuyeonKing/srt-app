@@ -27,16 +27,18 @@ index cf57850..f65f3e9 100644
  </manifest>
 \ No newline at end of file
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
-index 8bcae71..6f94729 100644
+index 8bcae71..dfd12b0 100644
 --- a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
-@@ -4,19 +4,20 @@ import android.os.Bundle
+@@ -4,19 +4,33 @@ import android.os.Bundle
  import androidx.activity.ComponentActivity
  import androidx.activity.compose.setContent
  import androidx.activity.viewModels
 -import com.whispercppdemo.ui.main.MainScreen
 -import com.whispercppdemo.ui.main.MainScreenViewModel
 +import androidx.compose.material3.Surface
++import com.whispercppdemo.subtitle.JobState
++import com.whispercppdemo.subtitle.LogBook
 +import com.whispercppdemo.subtitle.SubtitleScreen
 +import com.whispercppdemo.subtitle.SubtitleViewModel
  import com.whispercppdemo.ui.theme.WhisperCppDemoTheme
@@ -56,6 +58,17 @@ index 8bcae71..6f94729 100644
      }
 -}
 \ No newline at end of file
++
++    // 작업 중에 앱 화면을 벗어나거나 돌아온 시점을 동작 기록에 남김
++    override fun onStart() {
++        super.onStart()
++        if (JobState.running) LogBook.add(this, "앱 화면 복귀")
++    }
++
++    override fun onStop() {
++        if (JobState.running && !isChangingConfigurations) LogBook.add(this, "앱 화면 벗어남 (백그라운드)")
++        super.onStop()
++    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/AudioDecoder.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/AudioDecoder.kt
 new file mode 100644
@@ -235,12 +248,70 @@ index 0000000..9a2337f
 +
 +    fun flush() { out.write(bytes, 0, n); n = 0 }
 +}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt
+new file mode 100644
+index 0000000..2114f80
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt
+@@ -0,0 +1,52 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import com.whispercpp.whisper.WhisperSegment
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++
++/** 2분 단위마다 저장하는 진행 상태 (앱 종료·재부팅 후 이어서 처리용) */
++data class Checkpoint(
++    val totalSamples: Long,
++    val nextStart: Long,
++    val segments: List<WhisperSegment>
++)
++
++object CheckpointStore {
++    private fun dir(context: Context) = File(context.filesDir, "jobs").apply { mkdirs() }
++    fun pcmFile(context: Context, id: Long) = File(dir(context), "$id.pcm")
++    private fun jsonFile(context: Context, id: Long) = File(dir(context), "$id.json")
++
++    fun load(context: Context, id: Long): Checkpoint? = try {
++        val f = jsonFile(context, id)
++        if (!f.exists()) null else {
++            val o = JSONObject(f.readText())
++            val arr = o.getJSONArray("segments")
++            Checkpoint(
++                o.getLong("totalSamples"), o.getLong("nextStart"),
++                List(arr.length()) { i ->
++                    val s = arr.getJSONArray(i)
++                    WhisperSegment(s.getLong(0), s.getLong(1), s.getString(2))
++                }
++            )
++        }
++    } catch (e: Exception) {
++        null
++    }
++
++    fun save(context: Context, id: Long, cp: Checkpoint) {
++        val arr = JSONArray()
++        cp.segments.forEach { arr.put(JSONArray().put(it.startMs).put(it.endMs).put(it.text)) }
++        val o = JSONObject().put("totalSamples", cp.totalSamples).put("nextStart", cp.nextStart).put("segments", arr)
++        val tmp = File(dir(context), "$id.json.tmp")
++        tmp.writeText(o.toString())
++        tmp.renameTo(jsonFile(context, id))
++    }
++
++    /** 작업이 끝나면(완료·취소·오류) 임시 오디오와 진행 상태를 삭제 */
++    fun delete(context: Context, id: Long) {
++        jsonFile(context, id).delete()
++        pcmFile(context, id).delete()
++    }
++}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
 new file mode 100644
-index 0000000..b9eb306
+index 0000000..a7d2ee0
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,86 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -260,7 +331,8 @@ index 0000000..b9eb306
 +    val vad: Boolean,
 +    val lang: String,
 +    val result: String,      // 완료 / 취소 / 오류
-+    val count: Int           // 생성된 자막 수
++    val count: Int,          // 생성된 자막 수
++    val rawFile: String = "" // 앱 내부에 보관한 원본 인식 결과 파일 이름
 +) {
 +    fun summary(): String {
 +        val date = SimpleDateFormat("MM/dd HH:mm", Locale.KOREA).format(Date(time))
@@ -290,7 +362,7 @@ index 0000000..b9eb306
 +                HistoryEntry(
 +                    o.getLong("time"), o.getString("name"), o.getLong("videoMs"), o.getLong("procMs"),
 +                    o.getString("model"), o.getBoolean("vad"), o.getString("lang"),
-+                    o.getString("result"), o.getInt("count")
++                    o.getString("result"), o.getInt("count"), o.optString("rawFile", "")
 +                )
 +            }
 +        } catch (e: Exception) {
@@ -300,7 +372,10 @@ index 0000000..b9eb306
 +
 +    /** 기록을 맨 앞에 추가하고 전체 목록을 반환 */
 +    fun add(context: Context, e: HistoryEntry): List<HistoryEntry> {
-+        val list = (listOf(e) + load(context)).take(MAX)
++        val all = listOf(e) + load(context)
++        val list = all.take(MAX)
++        // 기록에서 밀려난 항목의 원본 파일도 삭제
++        all.drop(MAX).forEach { if (it.rawFile.isNotEmpty()) rawFile(context, it.rawFile).delete() }
 +        val arr = JSONArray()
 +        list.forEach {
 +            arr.put(
@@ -308,6 +383,7 @@ index 0000000..b9eb306
 +                    .put("time", it.time).put("name", it.name).put("videoMs", it.videoMs)
 +                    .put("procMs", it.procMs).put("model", it.model).put("vad", it.vad)
 +                    .put("lang", it.lang).put("result", it.result).put("count", it.count)
++                    .put("rawFile", it.rawFile)
 +            )
 +        }
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, arr.toString()).apply()
@@ -316,11 +392,15 @@ index 0000000..b9eb306
 +
 +    fun clear(context: Context) {
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
++        rawDir(context).listFiles()?.forEach { it.delete() }
 +    }
++
++    fun rawDir(context: Context) = java.io.File(context.filesDir, "raw").apply { mkdirs() }
++    fun rawFile(context: Context, name: String) = java.io.File(rawDir(context), name)
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 new file mode 100644
-index 0000000..ed9d678
+index 0000000..d28219e
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 @@ -0,0 +1,19 @@
@@ -330,19 +410,144 @@ index 0000000..ed9d678
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.setValue
 +
-+/** 서비스(백그라운드 작업)와 화면이 함께 보는 작업 상태 */
++/** 서비스(백그라운드 작업)와 화면이 함께 보는 상태 */
 +object JobState {
-+    var status by mutableStateOf("모델 불러오는 중...")
-+    var busy by mutableStateOf(true)        // 모델 로딩 또는 작업 중
-+    var running by mutableStateOf(false)    // 자막 생성 작업 중 (취소 가능)
-+    var lastSrt by mutableStateOf<String?>(null)
++    var status by mutableStateOf("대기 중 (모델은 시작할 때 불러옵니다)")
++    var running by mutableStateOf(false)    // 대기 목록 처리 중
++    var queue by mutableStateOf<List<QueueItem>>(emptyList())
 +    var history by mutableStateOf<List<HistoryEntry>>(emptyList())
++    var log by mutableStateOf<List<String>>(emptyList())
 +
 +    @Volatile
 +    var cancelRequested = false
 +}
 +
 +class CancelledByUser : Exception("사용자가 취소함")
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/LogBook.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/LogBook.kt
+new file mode 100644
+index 0000000..ff8c83d
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/LogBook.kt
+@@ -0,0 +1,35 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import org.json.JSONArray
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/** 동작 기록 (최근 300줄 보관) */
++object LogBook {
++    private const val PREFS = "log"
++    private const val KEY = "lines"
++    private const val MAX = 300
++    private val lock = Any()
++
++    fun load(context: Context): List<String> = try {
++        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null)
++        if (raw == null) emptyList() else JSONArray(raw).let { a -> List(a.length()) { a.getString(it) } }
++    } catch (e: Exception) {
++        emptyList()
++    }
++
++    fun add(context: Context, message: String) = synchronized(lock) {
++        val time = SimpleDateFormat("MM/dd HH:mm:ss", Locale.KOREA).format(Date())
++        val list = (load(context) + "$time  $message").takeLast(MAX)
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++            .putString(KEY, JSONArray(list).toString()).apply()
++        JobState.log = list
++    }
++
++    fun clear(context: Context) = synchronized(lock) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
++        JobState.log = emptyList()
++    }
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/QueueStore.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/QueueStore.kt
+new file mode 100644
+index 0000000..9f60a1c
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/QueueStore.kt
+@@ -0,0 +1,78 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** 대기 목록의 파일 한 개. state: 대기 / 처리중 / 완료 / 오류 / 취소 */
++data class QueueItem(
++    val id: Long,
++    val uri: String,
++    val name: String,
++    val lang: String,
++    val vad: Boolean,
++    val state: String
++)
++
++/** 대기 목록을 앱 내부에 저장 (앱이 종료돼도 유지 → 이어서 처리) */
++object QueueStore {
++    private const val PREFS = "queue"
++    private const val KEY = "items"
++    private val lock = Any()
++
++    fun load(context: Context): List<QueueItem> = synchronized(lock) {
++        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null)
++            ?: return@synchronized emptyList()
++        try {
++            val arr = JSONArray(raw)
++            List(arr.length()) { i ->
++                val o = arr.getJSONObject(i)
++                QueueItem(
++                    o.getLong("id"), o.getString("uri"), o.getString("name"),
++                    o.getString("lang"), o.getBoolean("vad"), o.getString("state")
++                )
++            }
++        } catch (e: Exception) {
++            emptyList()
++        }
++    }
++
++    private fun save(context: Context, list: List<QueueItem>) {
++        val arr = JSONArray()
++        list.forEach {
++            arr.put(
++                JSONObject().put("id", it.id).put("uri", it.uri).put("name", it.name)
++                    .put("lang", it.lang).put("vad", it.vad).put("state", it.state)
++            )
++        }
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, arr.toString()).commit()
++        JobState.queue = list
++    }
++
++    fun add(context: Context, items: List<QueueItem>) = synchronized(lock) {
++        save(context, load(context) + items)
++    }
++
++    fun setState(context: Context, id: Long, state: String) = synchronized(lock) {
++        save(context, load(context).map { if (it.id == id) it.copy(state = state) else it })
++    }
++
++    fun remove(context: Context, id: Long) = synchronized(lock) {
++        save(context, load(context).filterNot { it.id == id })
++    }
++
++    /** 완료·오류·취소된 항목 정리 */
++    fun clearFinished(context: Context) = synchronized(lock) {
++        save(context, load(context).filter { it.state == "대기" || it.state == "처리중" })
++    }
++
++    /** 다음에 처리할 항목: 중단됐던 '처리중'을 먼저, 그다음 '대기' 순서 */
++    fun next(context: Context): QueueItem? {
++        val list = load(context)
++        return list.firstOrNull { it.state == "처리중" } ?: list.firstOrNull { it.state == "대기" }
++    }
++
++    fun refresh(context: Context) {
++        JobState.queue = load(context)
++    }
++}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
 index 0000000..8a2b7dd
@@ -468,10 +673,10 @@ index 0000000..8a2b7dd
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..8ea7299
+index 0000000..215d217
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,118 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -484,74 +689,104 @@ index 0000000..8ea7299
 +import kotlinx.coroutines.isActive
 +import kotlinx.coroutines.launch
 +import kotlinx.coroutines.withContext
-+import java.io.File
 +
-+/** 영상 → 16kHz PCM → 구간별 인식 → SRT 문자열 */
-+class SubtitlePipeline(private val context: Context, private val whisper: WhisperContext) {
-+    /** 오디오 추출 후 알게 된 영상 길이 (ms) */
++/**
++ * 영상 한 개 처리: 오디오 추출 → 2분 단위 인식 → 구간마다 진행 상태 저장.
++ * 진행 상태가 남아 있으면 멈춘 지점부터 이어서 처리한다.
++ */
++class SubtitlePipeline(
++    private val context: Context,
++    private val whisper: WhisperContext,
++    private val item: QueueItem,
++    private val vadModelPath: String?,
++    private val onStatus: (String) -> Unit,
++    private val onLog: (String) -> Unit,
++    private val waitIfNeeded: suspend () -> Unit,
++    private val thermalName: () -> String
++) {
++    /** 영상 길이 (ms) */
 +    var totalMs = 0L
 +        private set
 +
-+    suspend fun run(
-+        videoUri: Uri,
-+        language: String,
-+        vadModelPath: String?,
-+        chunkMinutes: Int = 2, // 인식이 어긋나도 피해가 최대 2분으로 제한되도록
-+        onStatus: (String) -> Unit
-+    ): List<WhisperSegment> = withContext(Dispatchers.IO) {
-+        val pcm = File(context.cacheDir, "audio_16k.pcm")
++    private val rate = AudioDecoder.TARGET_RATE
++    private val chunkSamples = rate.toLong() * 60 * 2 // 2분 단위
++
++    suspend fun run(): List<WhisperSegment> = withContext(Dispatchers.IO) {
++        val pcm = CheckpointStore.pcmFile(context, item.id)
 +        val jobStart = System.currentTimeMillis()
 +        fun elapsed() = "경과 ${hms(System.currentTimeMillis() - jobStart)}"
-+        try {
-+            val total = AudioDecoder.decodeToPcm16k(context, videoUri, pcm) {
++
++        // 1) 오디오 준비: 이전 진행 상태가 있으면 재사용
++        val saved = CheckpointStore.load(context, item.id)
++        val cp: Checkpoint = if (saved != null && pcm.exists() && pcm.length() == saved.totalSamples * 2) {
++            onLog("이어서 처리: ${hms(saved.nextStart * 1000 / rate)} 지점부터")
++            saved
++        } else {
++            onLog("오디오 추출 시작")
++            val decoded = AudioDecoder.decodeToPcm16k(context, Uri.parse(item.uri), pcm) {
 +                checkCancel()
 +                onStatus("오디오 추출 $it% · ${elapsed()}")
 +            }
-+            val rate = AudioDecoder.TARGET_RATE
-+            val chunk = rate.toLong() * 60 * chunkMinutes
-+            val totalMs = total * 1000 / rate
-+            this@SubtitlePipeline.totalMs = totalMs
-+            val segments = mutableListOf<WhisperSegment>()
-+            val recogStart = System.currentTimeMillis()
-+
-+            // 인식에 걸린 시간과 진행 위치로 남은 시간을 추정 (2% 이상 진행 후 표시)
-+            fun line(doneMs: Long): String {
-+                val pct = if (totalMs > 0) doneMs * 100 / totalMs else 0
-+                val spent = System.currentTimeMillis() - recogStart
-+                val eta = if (pct >= 2 && doneMs > 0) " · 남은 시간 약 ${hms(spent * (totalMs - doneMs) / doneMs)}" else ""
-+                return "인식 중 ${hms(doneMs)} / ${hms(totalMs)} ($pct%)\n${elapsed()}$eta"
++            Checkpoint(decoded, 0, emptyList()).also {
++                CheckpointStore.save(context, item.id, it)
++                onLog("오디오 추출 완료 (영상 길이 ${hms(decoded * 1000 / rate)})")
 +            }
++        }
 +
-+            var start = 0L
-+            while (start < total) {
-+                checkCancel()
-+                val n = minOf(chunk, total - start).toInt()
-+                val offsetMs = start * 1000 / rate
-+                val chunkMs = n.toLong() * 1000 / rate
++        val total = cp.totalSamples
++        totalMs = total * 1000 / rate
++        val segments = cp.segments.toMutableList()
++        var start = cp.nextStart
++        val recogStart = System.currentTimeMillis()
++        val startedAtMs = start * 1000 / rate
 +
-+                val result = coroutineScope {
-+                    // 인식 진행률을 1초마다 읽어 전체 기준 시간으로 표시
-+                    onStatus(line(offsetMs))
-+                    val poller = launch {
-+                        while (isActive) {
-+                            delay(1000) // 새 구간 시작 시 진행률이 0으로 초기화된 뒤 읽기
-+                            onStatus(line(offsetMs + chunkMs * WhisperContext.currentProgress() / 100))
-+                        }
-+                    }
-+                    try {
-+                        whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), language, vadModelPath)
-+                    } finally {
-+                        poller.cancel()
++        // 이번 실행에서 인식한 분량 기준으로 남은 시간 추정
++        fun line(doneMs: Long): String {
++            val pct = if (totalMs > 0) doneMs * 100 / totalMs else 0
++            val spent = System.currentTimeMillis() - recogStart
++            val doneNow = doneMs - startedAtMs
++            val eta = if (pct >= 2 && doneNow > 0) " · 남은 시간 약 ${hms(spent * (totalMs - doneMs) / doneNow)}" else ""
++            return "인식 중 ${hms(doneMs)} / ${hms(totalMs)} ($pct%)\n${elapsed()}$eta"
++        }
++
++        // 2) 2분 단위 인식
++        while (start < total) {
++            checkCancel()
++            waitIfNeeded()
++            checkCancel()
++
++            val n = minOf(chunkSamples, total - start).toInt()
++            val offsetMs = start * 1000 / rate
++            val chunkMs = n.toLong() * 1000 / rate
++            val chunkStart = System.currentTimeMillis()
++
++            val result = coroutineScope {
++                onStatus(line(offsetMs))
++                val poller = launch {
++                    while (isActive) {
++                        delay(1000)
++                        onStatus(line(offsetMs + chunkMs * WhisperContext.currentProgress() / 100))
 +                    }
 +                }
-+                checkCancel() // 인식 도중 취소된 경우 결과를 버림
-+                result.mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
-+                start += n
++                try {
++                    whisper.transcribeSegments(AudioDecoder.readChunk(pcm, start, n), item.lang, vadModelPath)
++                } finally {
++                    poller.cancel()
++                }
 +            }
-+            segments
-+        } finally {
-+            pcm.delete()
++            checkCancel() // 인식 도중 취소된 경우 결과를 버림
++
++            result.mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
++            start += n
++            CheckpointStore.save(context, item.id, Checkpoint(total, start, segments))
++
++            val took = System.currentTimeMillis() - chunkStart
++            onLog(
++                "${hms(start * 1000 / rate)}까지 인식 · 이번 구간 ${took / 1000}초 " +
++                    "(%.2f배) · 기기 온도 ${thermalName()}".format(took.toDouble() / chunkMs)
++            )
 +        }
++        segments
 +    }
 +
 +    private fun checkCancel() {
@@ -562,30 +797,32 @@ index 0000000..8ea7299
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..2ab0a5e
+index 0000000..f255db0
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,149 @@
 +package com.whispercppdemo.subtitle
 +
-+import androidx.activity.compose.rememberLauncherForActivityResult
 +import android.Manifest
 +import android.os.Build
++import androidx.activity.compose.rememberLauncherForActivityResult
 +import androidx.activity.result.contract.ActivityResultContracts
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.rememberScrollState
 +import androidx.compose.foundation.verticalScroll
-+import androidx.compose.material3.Divider
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.TextButton
 +import androidx.compose.material3.Button
 +import androidx.compose.material3.Checkbox
++import androidx.compose.material3.Divider
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
 +import androidx.compose.material3.RadioButton
 +import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.ui.Alignment
@@ -594,48 +831,105 @@ index 0000000..2ab0a5e
 +
 +@Composable
 +fun SubtitleScreen(vm: SubtitleViewModel) {
-+    // Android 13 이상: 완료 알림을 띄우기 위한 알림 권한 요청
++    // Android 13 이상: 진행 알림 권한 요청 (거부해도 작업은 정상 동작)
 +    val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 +    LaunchedEffect(Unit) {
 +        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
 +            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
 +        }
 +    }
-+
-+    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-+        uri?.let(vm::transcribe)
++    val pickVideos = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
++        if (uris.isNotEmpty()) vm.onPicked(uris)
 +    }
-+    val saveSrt = rememberLauncherForActivityResult(
++    val saveRaw = rememberLauncherForActivityResult(
 +        ActivityResultContracts.CreateDocument("application/x-subrip")
-+    ) { uri -> uri?.let(vm::save) }
++    ) { uri -> if (uri != null) vm.saveRaw(uri) }
++
++    val small = MaterialTheme.typography.bodySmall
 +
 +    Column(
 +        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-+        verticalArrangement = Arrangement.spacedBy(12.dp)
++        verticalArrangement = Arrangement.spacedBy(10.dp)
 +    ) {
++        // ── 설정 ──
 +        Row(verticalAlignment = Alignment.CenterVertically) {
 +            Text("음성 언어")
 +            listOf("ja" to "일본어", "en" to "영어").forEach { (code, label) ->
-+                RadioButton(selected = vm.language == code, onClick = { vm.selectLanguage(code) }, enabled = !vm.busy)
++                RadioButton(selected = vm.language == code, onClick = { vm.selectLanguage(code) })
 +                Text(label)
 +            }
 +        }
 +        Row(verticalAlignment = Alignment.CenterVertically) {
-+            Checkbox(checked = vm.useVad, onCheckedChange = { vm.toggleVad(it) }, enabled = !vm.busy)
-+            Text("목소리 없는 구간 건너뛰기 (VAD)")
++            Checkbox(checked = vm.useVad, onCheckedChange = { vm.toggleVad(it) })
++            Text("목소리 없는 구간 건너뛰기 (VAD, 대사 누락 가능)")
 +        }
-+        Button(onClick = { pickVideo.launch(arrayOf("video/*")) }, enabled = !vm.busy) {
-+            Text("영상 선택 → 자막 생성")
-+        }
-+        Button(onClick = { vm.cancel() }, enabled = vm.running) {
-+            Text("취소")
-+        }
-+        Button(onClick = { saveSrt.launch("subtitle.srt") }, enabled = !vm.busy && vm.lastSrt != null) {
-+            Text("SRT 저장")
-+        }
-+        Text(vm.status)
-+        Text("작업 중에는 다른 앱을 쓰거나 화면을 꺼도 됩니다. 완료되면 알림이 뜹니다.")
++        Text("언어·VAD 설정은 대기 목록에 넣는 시점의 값이 파일마다 적용됩니다.", style = small)
 +
++        // ── 영상 선택 / 시작 ──
++        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            OutlinedButton(onClick = { pickVideos.launch(arrayOf("video/*")) }) { Text("영상 선택") }
++            if (vm.selected.isNotEmpty()) {
++                TextButton(onClick = { vm.clearSelected() }) { Text("선택 비우기") }
++            }
++        }
++        if (vm.selected.isNotEmpty()) {
++            Text("선택한 영상 ${vm.selected.size}개", style = MaterialTheme.typography.titleSmall)
++            vm.selected.forEach { (_, name) -> Text("· $name", style = small) }
++        }
++        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            val label = when {
++                vm.selected.isNotEmpty() && vm.running -> "대기 목록에 추가"
++                vm.selected.isNotEmpty() -> "시작"
++                vm.wasInterrupted -> "이어서 처리"
++                else -> "대기 목록 시작"
++            }
++            Button(
++                onClick = { vm.enqueueAndStart() },
++                enabled = vm.selected.isNotEmpty() || (!vm.running && vm.hasUnfinished)
++            ) { Text(label) }
++            OutlinedButton(onClick = { vm.cancel() }, enabled = vm.running) { Text("취소") }
++        }
++
++        // ── 현재 상태 ──
++        Text(vm.status)
++        Text(
++            if (vm.running) "작업 중에는 다른 앱을 쓰거나 화면을 꺼도 됩니다."
++            else "백그라운드 작업 없음",
++            style = small
++        )
++
++        // ── 대기 목록 ──
++        Divider()
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text("대기 목록 (${vm.queue.size})", style = MaterialTheme.typography.titleMedium)
++            TextButton(
++                onClick = { vm.clearFinished() },
++                enabled = vm.queue.any { it.state != "대기" && it.state != "처리중" }
++            ) { Text("끝난 항목 정리") }
++        }
++        if (vm.queue.isEmpty()) Text("비어 있음", style = small)
++        vm.queue.forEach { item ->
++            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    "[${item.state}] ${item.name} · ${if (item.lang == "ja") "일본어" else "영어"} · VAD ${if (item.vad) "켬" else "끔"}",
++                    style = small,
++                    modifier = Modifier.weight(1f)
++                )
++                val removable = !(vm.running && item.state == "처리중")
++                if (removable) TextButton(onClick = { vm.removeFromQueue(item) }) { Text("빼기") }
++            }
++        }
++
++        // ── 동작 기록 ──
++        Divider()
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text("동작 기록 (최근 40줄)", style = MaterialTheme.typography.titleMedium)
++            TextButton(onClick = { vm.clearLog() }, enabled = vm.log.isNotEmpty() && !vm.running) { Text("지우기") }
++        }
++        if (vm.log.isEmpty()) Text("기록 없음", style = small)
++        vm.log.takeLast(40).reversed().forEach { Text(it, style = small) }
++
++        // ── 처리 기록 ──
 +        Divider()
 +        Row(verticalAlignment = Alignment.CenterVertically) {
 +            Text("처리 기록 (최근 30건)", style = MaterialTheme.typography.titleMedium)
@@ -643,21 +937,25 @@ index 0000000..2ab0a5e
 +                Text("기록 지우기")
 +            }
 +        }
-+        if (vm.history.isEmpty()) {
-+            Text("아직 기록이 없습니다.", style = MaterialTheme.typography.bodySmall)
-+        }
++        if (vm.history.isEmpty()) Text("아직 기록이 없습니다.", style = small)
 +        vm.history.forEach { entry ->
-+            Text(entry.summary(), style = MaterialTheme.typography.bodySmall)
++            Text(entry.summary(), style = small)
++            if (vm.rawAvailable(entry)) {
++                TextButton(onClick = {
++                    vm.pendingRaw = entry
++                    saveRaw.launch(entry.name.substringBeforeLast('.') + "_raw.srt")
++                }) { Text("원본(raw) 저장") }
++            }
 +            Divider()
 +        }
 +    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..00c12b6
+index 0000000..f6299a6
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,306 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -665,37 +963,49 @@ index 0000000..00c12b6
 +import android.app.NotificationManager
 +import android.app.PendingIntent
 +import android.app.Service
++import android.content.BroadcastReceiver
 +import android.content.ContentValues
 +import android.content.Context
 +import android.content.Intent
++import android.content.IntentFilter
 +import android.content.pm.ServiceInfo
 +import android.graphics.drawable.Icon
-+import android.net.Uri
++import android.os.BatteryManager
 +import android.os.Build
 +import android.os.Environment
 +import android.os.IBinder
 +import android.os.PowerManager
 +import android.provider.MediaStore
-+import android.provider.OpenableColumns
 +import com.whispercpp.whisper.WhisperContext
 +import com.whispercppdemo.MainActivity
 +import kotlinx.coroutines.CoroutineScope
 +import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.SupervisorJob
 +import kotlinx.coroutines.cancel
++import kotlinx.coroutines.delay
 +import kotlinx.coroutines.launch
 +
 +/**
-+ * 자막 생성을 포그라운드 서비스로 실행한다.
-+ * - 진행 상황 알림 표시 (화면을 꺼도, 다른 앱을 써도 계속 진행)
-+ * - 완료 시 알림 + Download/SRT 폴더에 자동 저장
++ * 대기 목록을 순서대로 처리하는 포그라운드 서비스.
++ * - 진행 알림만 표시 (완료 알림 없음)
++ * - 과열·배터리 부족 시 대기, 앱 종료 후에도 이어서 처리 가능
++ * - 목록이 끝나면 모델을 메모리에서 해제
 + */
 +class SubtitleService : Service() {
 +    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 +    private var wakeLock: PowerManager.WakeLock? = null
-+    private var lastShown = ""
 +    private var running = false
-+    private var useVad = true
++    private var lastShown = ""
++    private var title = "자막 생성 중"
++
++    private val screenReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context, intent: Intent) {
++            when (intent.action) {
++                Intent.ACTION_SCREEN_OFF -> log("화면 꺼짐")
++                Intent.ACTION_SCREEN_ON -> log("화면 켜짐")
++            }
++        }
++    }
 +
 +    override fun onBind(intent: Intent?): IBinder? = null
 +
@@ -711,90 +1021,170 @@ index 0000000..00c12b6
 +            return START_NOT_STICKY
 +        }
 +
-+        val uri = intent?.data
-+        val language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "ja"
-+        useVad = intent?.getBooleanExtra(EXTRA_VAD, true) ?: true
-+        if (uri == null || running) return START_NOT_STICKY
-+        running = true
-+        JobState.cancelRequested = false
-+        JobState.running = true
-+
-+        createChannels()
-+        val first = progressNotification("자막 생성 준비 중...")
++        manager().createNotificationChannel(
++            NotificationChannel(CH_PROGRESS, "자막 생성 진행", NotificationManager.IMPORTANCE_LOW)
++        )
++        val n = progressNotification(if (lastShown.isEmpty()) "준비 중..." else lastShown)
 +        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-+            startForeground(ID_PROGRESS, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
++            startForeground(ID_PROGRESS, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
 +        } else {
-+            startForeground(ID_PROGRESS, first)
++            startForeground(ID_PROGRESS, n)
 +        }
++        if (running) return START_NOT_STICKY // 이미 처리 중이면 새 항목은 목록에서 이어서 처리됨
++
++        running = true
++        JobState.running = true
++        JobState.cancelRequested = false
 +        wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
 +            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "srtapp:transcribe")
-+            .apply { acquire(6 * 60 * 60 * 1000L) } // 안전장치: 최대 6시간
-+
-+        JobState.busy = true
-+        JobState.lastSrt = null
-+        scope.launch { runJob(uri, language) }
++            .apply { acquire(24 * 60 * 60 * 1000L) } // 안전장치: 최대 24시간
++        registerReceiver(screenReceiver, IntentFilter().apply {
++            addAction(Intent.ACTION_SCREEN_OFF)
++            addAction(Intent.ACTION_SCREEN_ON)
++        })
++        scope.launch { runQueue() }
 +        return START_NOT_STICKY
 +    }
 +
-+    private suspend fun runJob(uri: Uri, language: String) {
++    private suspend fun runQueue() {
++        log("대기 목록 처리 시작")
++        try {
++            while (!JobState.cancelRequested) {
++                val item = QueueStore.next(this) ?: break
++                processItem(item)
++            }
++        } finally {
++            val cancelled = JobState.cancelRequested
++            try {
++                WhisperHolder.release()
++            } catch (_: Exception) {
++            }
++            log(if (cancelled) "취소됨 · 모델 메모리 해제" else "대기 목록 완료 · 모델 메모리 해제")
++            JobState.status = if (cancelled) "취소됨 (남은 항목은 대기 상태로 유지)" else "작업 없음 (모델 메모리 해제됨)"
++            JobState.running = false
++            JobState.cancelRequested = false
++            try {
++                unregisterReceiver(screenReceiver)
++            } catch (_: Exception) {
++            }
++            wakeLock?.let { if (it.isHeld) it.release() }
++            running = false
++            stopForeground(STOP_FOREGROUND_REMOVE)
++            stopSelf()
++        }
++    }
++
++    private suspend fun processItem(item: QueueItem) {
 +        val started = System.currentTimeMillis()
-+        val videoName = displayName(uri)
++        QueueStore.setState(this, item.id, "처리중")
++        val all = QueueStore.load(this)
++        val pos = all.indexOfFirst { it.id == item.id } + 1
++        title = "자막 생성 중 ($pos/${all.size}) ${item.name}"
++        log("▶ ${item.name} 시작 (${if (item.lang == "ja") "일본어" else "영어"}, VAD ${if (item.vad) "켬" else "끔"})")
++
 +        var pipeline: SubtitlePipeline? = null
 +        var result = "오류"
 +        var count = 0
++        var rawName = ""
 +        try {
++            if (!WhisperHolder.isLoaded()) {
++                update("모델 불러오는 중...")
++                val t = System.currentTimeMillis()
++                WhisperHolder.get(this)
++                log("모델 불러오기 완료 (${(System.currentTimeMillis() - t) / 1000}초)")
++            }
 +            val whisper = WhisperHolder.get(this)
-+            val vadPath = if (useVad) WhisperHolder.vadModelPath(this) else null
-+            pipeline = SubtitlePipeline(this, whisper)
-+            val segments = pipeline.run(uri, language, vadPath) { update(it) }
-+            val srt = SrtWriter.toSrt(segments, language)
-+            JobState.lastSrt = srt
-+            autoSave(videoName, SrtWriter.toRawSrt(segments), suffix = "_raw")
-+            result = "완료"
++            val vadPath = if (item.vad) WhisperHolder.vadModelPath(this) else null
++            pipeline = SubtitlePipeline(
++                this, whisper, item, vadPath,
++                onStatus = { update(it) },
++                onLog = { log(it) },
++                waitIfNeeded = { waitIfNeeded() },
++                thermalName = { thermalName() }
++            )
++            val segments = pipeline.run()
++
++            val srt = SrtWriter.toSrt(segments, item.lang)
 +            count = Regex(" --> ").findAll(srt).count()
-+            val savedAs = autoSave(videoName, srt)
-+            val sec = (System.currentTimeMillis() - started) / 1000
-+            val time = "${sec / 60}분 ${sec % 60}초"
-+            JobState.status = "완료 — 처리 시간 $time" +
-+                (savedAs?.let { "\n자동 저장: Download/SRT/$it" } ?: "\n[SRT 저장]을 누르세요")
-+            notifyDone("자막 생성 완료 ($time)", savedAs?.let { "Download/SRT/$it" } ?: videoName)
++            val saved = saveToDownloads(item.name, srt)
++            rawName = "${item.id}.srt"
++            HistoryStore.rawFile(this, rawName).writeText(SrtWriter.toRawSrt(segments))
++            result = "완료"
++            QueueStore.setState(this, item.id, "완료")
++            log("✔ ${item.name} 완료 · 자막 ${count}개 · ${saved?.let { "Download/SRT/$it" } ?: "저장 실패"}")
 +        } catch (e: CancelledByUser) {
 +            result = "취소"
-+            JobState.status = "취소됨"
++            QueueStore.setState(this, item.id, "대기") // 취소한 파일은 대기 상태로 되돌림 (결과는 버림)
++            log("■ ${item.name} 취소 (진행 결과 삭제)")
 +        } catch (e: Exception) {
 +            if (JobState.cancelRequested) {
 +                result = "취소"
-+                JobState.status = "취소됨"
++                QueueStore.setState(this, item.id, "대기")
++                log("■ ${item.name} 취소 (진행 결과 삭제)")
 +            } else {
-+                JobState.status = "오류: ${e.message}"
-+                notifyDone("자막 생성 실패", e.message ?: "알 수 없는 오류")
++                QueueStore.setState(this, item.id, "오류")
++                log("✖ ${item.name} 오류: ${e.message}")
 +            }
 +        } finally {
++            CheckpointStore.delete(this, item.id)
 +            try {
 +                JobState.history = HistoryStore.add(
 +                    this,
 +                    HistoryEntry(
 +                        time = started,
-+                        name = videoName,
++                        name = item.name,
 +                        videoMs = pipeline?.totalMs ?: 0L,
 +                        procMs = System.currentTimeMillis() - started,
 +                        model = WhisperHolder.modelName ?: "?",
-+                        vad = useVad,
-+                        lang = language,
++                        vad = item.vad,
++                        lang = item.lang,
 +                        result = result,
-+                        count = count
++                        count = count,
++                        rawFile = rawName
 +                    )
 +                )
 +            } catch (_: Exception) {
 +            }
-+            JobState.busy = false
-+            JobState.running = false
-+            JobState.cancelRequested = false
-+            wakeLock?.let { if (it.isHeld) it.release() }
-+            stopForeground(STOP_FOREGROUND_REMOVE)
-+            stopSelf()
 +        }
 +    }
++
++    /** 과열(심각 단계 이상)이거나, 충전 중이 아닌데 배터리 20% 미만이면 대기 */
++    private suspend fun waitIfNeeded() {
++        var waiting = false
++        while (!JobState.cancelRequested) {
++            val hot = thermalStatus() >= PowerManager.THERMAL_STATUS_SEVERE
++            val bm = getSystemService(BatteryManager::class.java)
++            val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
++            val low = !bm.isCharging && level in 0 until 20
++            if (!hot && !low) {
++                if (waiting) log("대기 해제 · 처리 재개 (기기 온도 ${thermalName()}, 배터리 $level%)")
++                return
++            }
++            if (!waiting) {
++                log(if (hot) "기기 과열(${thermalName()}) → 식을 때까지 대기" else "배터리 $level% → 충전될 때까지 대기")
++                waiting = true
++            }
++            update(if (hot) "기기 과열로 대기 중... (식으면 자동 재개)" else "배터리 부족으로 대기 중... (충전하면 자동 재개)")
++            delay(30_000)
++        }
++    }
++
++    private fun thermalStatus(): Int =
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
++            (getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus
++        else 0
++
++    private fun thermalName(): String = when (thermalStatus()) {
++        0 -> "정상"
++        1 -> "약간 따뜻함"
++        2 -> "따뜻함"
++        3 -> "뜨거움(심각)"
++        4 -> "매우 뜨거움(위험)"
++        5 -> "긴급"
++        else -> "종료 직전"
++    }
++
++    private fun log(message: String) = LogBook.add(this, message)
 +
 +    /** 진행 상황을 화면과 알림에 반영 (같은 문구면 알림 갱신 생략) */
 +    private fun update(text: String) {
@@ -805,10 +1195,10 @@ index 0000000..00c12b6
 +        }
 +    }
 +
-+    /** Android 10 이상: Download/SRT/<영상이름>.srt 로 자동 저장 */
-+    private fun autoSave(videoName: String, srt: String, suffix: String = ""): String? {
++    /** Android 10 이상: Download/SRT/<영상이름>.srt 로 저장 */
++    private fun saveToDownloads(videoName: String, srt: String): String? {
 +        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
-+        val fileName = videoName.substringBeforeLast('.') + suffix + ".srt"
++        val fileName = videoName.substringBeforeLast('.') + ".srt"
 +        return try {
 +            val values = ContentValues().apply {
 +                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
@@ -823,39 +1213,22 @@ index 0000000..00c12b6
 +        }
 +    }
 +
-+    private fun displayName(uri: Uri): String = try {
-+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-+            if (it.moveToFirst()) it.getString(0) else null
-+        } ?: "subtitle"
-+    } catch (e: Exception) {
-+        "subtitle"
-+    }
-+
 +    private fun manager() = getSystemService(NotificationManager::class.java)
-+
-+    private fun createChannels() {
-+        manager().createNotificationChannel(
-+            NotificationChannel(CH_PROGRESS, "자막 생성 진행", NotificationManager.IMPORTANCE_LOW)
-+        )
-+        manager().createNotificationChannel(
-+            NotificationChannel(CH_DONE, "자막 생성 완료", NotificationManager.IMPORTANCE_HIGH)
-+        )
-+    }
-+
-+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
-+        this, 0,
-+        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-+    )
 +
 +    private fun progressNotification(text: String): Notification =
 +        Notification.Builder(this, CH_PROGRESS)
 +            .setSmallIcon(android.R.drawable.stat_sys_download)
-+            .setContentTitle("자막 생성 중")
++            .setContentTitle(title)
 +            .setContentText(text)
 +            .setOngoing(true)
 +            .setOnlyAlertOnce(true)
-+            .setContentIntent(openAppIntent())
++            .setContentIntent(
++                PendingIntent.getActivity(
++                    this, 0,
++                    Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
++                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++                )
++            )
 +            .addAction(
 +                Notification.Action.Builder(
 +                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
@@ -869,19 +1242,6 @@ index 0000000..00c12b6
 +            )
 +            .build()
 +
-+    private fun notifyDone(title: String, text: String) {
-+        manager().notify(
-+            ID_DONE,
-+            Notification.Builder(this, CH_DONE)
-+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
-+                .setContentTitle(title)
-+                .setContentText(text)
-+                .setAutoCancel(true)
-+                .setContentIntent(openAppIntent())
-+                .build()
-+        )
-+    }
-+
 +    override fun onDestroy() {
 +        scope.cancel()
 +        wakeLock?.let { if (it.isHeld) it.release() }
@@ -889,21 +1249,12 @@ index 0000000..00c12b6
 +    }
 +
 +    companion object {
-+        const val EXTRA_LANGUAGE = "language"
-+        const val EXTRA_VAD = "vad"
 +        const val ACTION_CANCEL = "com.whispercppdemo.subtitle.CANCEL"
 +        private const val CH_PROGRESS = "progress"
-+        private const val CH_DONE = "done"
 +        private const val ID_PROGRESS = 1
-+        private const val ID_DONE = 2
 +
-+        fun start(context: Context, uri: Uri, language: String, vad: Boolean) {
-+            val intent = Intent(context, SubtitleService::class.java)
-+                .setData(uri)
-+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-+                .putExtra(EXTRA_LANGUAGE, language)
-+                .putExtra(EXTRA_VAD, vad)
-+            context.startForegroundService(intent)
++        fun start(context: Context) {
++            context.startForegroundService(Intent(context, SubtitleService::class.java))
 +        }
 +
 +        fun cancel(context: Context) {
@@ -913,16 +1264,17 @@ index 0000000..00c12b6
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..6b80572
+index 0000000..97d883a
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,136 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
 +import android.content.Context
 +import android.content.Intent
 +import android.net.Uri
++import android.provider.OpenableColumns
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.setValue
@@ -933,27 +1285,78 @@ index 0000000..6b80572
 +
 +class SubtitleViewModel(private val app: Application) : AndroidViewModel(app) {
 +    val status get() = JobState.status
-+    val busy get() = JobState.busy
-+    val lastSrt get() = JobState.lastSrt
 +    val running get() = JobState.running
++    val queue get() = JobState.queue
++    val history get() = JobState.history
++    val log get() = JobState.log
 +
-+    // 선택한 언어를 기기에 저장 (기본: 일본어)
 +    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
++
++    // 선택한 언어 (기본: 일본어)
 +    var language by mutableStateOf(prefs.getString("language", "ja") ?: "ja")
 +        private set
++
++    // VAD 사용 여부 (기본: 끔 — 대사·감탄사 누락 방지)
++    var useVad by mutableStateOf(prefs.getBoolean("vad2", false))
++        private set
++
++    // 선택했지만 아직 대기 목록에 넣지 않은 영상
++    var selected by mutableStateOf<List<Pair<Uri, String>>>(emptyList())
++        private set
++
++    // 원본 저장을 누른 기록 항목
++    var pendingRaw: HistoryEntry? = null
++
++    /** 처리 중이 아닌데 남아 있는 항목 (앱 종료·재부팅으로 중단된 경우 포함) */
++    val hasUnfinished get() = queue.any { it.state == "대기" || it.state == "처리중" }
++    val wasInterrupted get() = !running && queue.any { it.state == "처리중" }
++
++    init {
++        QueueStore.refresh(app)
++        if (JobState.history.isEmpty()) JobState.history = HistoryStore.load(app)
++        if (JobState.log.isEmpty()) JobState.log = LogBook.load(app)
++        if (wasInterrupted) JobState.status = "중단된 작업이 있습니다. [이어서 처리]를 누르면 멈춘 지점부터 다시 시작합니다."
++    }
 +
 +    fun selectLanguage(code: String) {
 +        language = code
 +        prefs.edit().putString("language", code).apply()
 +    }
 +
-+    // VAD(비음성 구간 건너뛰기) 사용 여부 저장 (기본: 켜짐)
-+    var useVad by mutableStateOf(prefs.getBoolean("vad", true))
-+        private set
-+
 +    fun toggleVad(on: Boolean) {
 +        useVad = on
-+        prefs.edit().putBoolean("vad", on).apply()
++        prefs.edit().putBoolean("vad2", on).apply()
++    }
++
++    fun onPicked(uris: List<Uri>) {
++        val list = uris.map { uri ->
++            try {
++                app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
++            } catch (_: SecurityException) {
++            }
++            uri to displayName(uri)
++        }
++        selected = selected + list
++    }
++
++    fun clearSelected() {
++        selected = emptyList()
++    }
++
++    /** 선택한 영상을 현재 언어·VAD 설정으로 대기 목록에 넣고, 처리 중이 아니면 시작 */
++    fun enqueueAndStart() {
++        if (selected.isNotEmpty()) {
++            val base = System.currentTimeMillis()
++            QueueStore.add(app, selected.mapIndexed { i, (uri, name) ->
++                QueueItem(base + i, uri.toString(), name, language, useVad, "대기")
++            })
++            LogBook.add(app, "대기 목록에 ${selected.size}개 추가")
++            selected = emptyList()
++        }
++        if (!running && QueueStore.next(app) != null) {
++            JobState.status = "시작 중... (알림창에서 진행 상황 확인 가능)"
++            SubtitleService.start(app)
++        }
 +    }
 +
 +    fun cancel() {
@@ -961,56 +1364,52 @@ index 0000000..6b80572
 +        SubtitleService.cancel(app)
 +    }
 +
-+    val history get() = JobState.history
++    fun removeFromQueue(item: QueueItem) {
++        QueueStore.remove(app, item.id)
++        CheckpointStore.delete(app, item.id)
++    }
++
++    fun clearFinished() = QueueStore.clearFinished(app)
 +
 +    fun clearHistory() {
 +        HistoryStore.clear(app)
 +        JobState.history = emptyList()
 +    }
 +
-+    init {
-+        if (JobState.history.isEmpty()) JobState.history = HistoryStore.load(app)
-+        // 작업이 이미 진행 중(앱을 다시 연 경우)이면 상태를 건드리지 않는다
-+        if (JobState.lastSrt == null && JobState.status.startsWith("모델")) {
-+            viewModelScope.launch {
-+                try {
-+                    WhisperHolder.get(app)
-+                    JobState.status = "준비 완료 (모델: ${WhisperHolder.modelName})"
-+                    JobState.busy = false
-+                } catch (e: Exception) {
-+                    JobState.status = "오류: ${e.message}"
-+                }
++    fun clearLog() = LogBook.clear(app)
++
++    /** 원본(raw) SRT를 사용자가 고른 위치에 저장 */
++    fun saveRaw(target: Uri) {
++        val entry = pendingRaw ?: return
++        pendingRaw = null
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val src = HistoryStore.rawFile(app, entry.rawFile)
++                app.contentResolver.openOutputStream(target)?.use { out -> src.inputStream().use { it.copyTo(out) } }
++                JobState.status = "원본 저장 완료: ${entry.name}"
++            } catch (e: Exception) {
++                JobState.status = "원본 저장 실패: ${e.message}"
 +            }
 +        }
 +    }
 +
-+    fun transcribe(videoUri: Uri) {
-+        try {
-+            app.contentResolver.takePersistableUriPermission(videoUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-+        } catch (_: SecurityException) {
-+            // 영구 권한을 줄 수 없는 경로여도 실행 중에는 읽을 수 있으므로 계속 진행
-+        }
-+        JobState.busy = true
-+        JobState.running = true
-+        JobState.lastSrt = null
-+        JobState.status = "시작 중... (알림창에서 진행 상황 확인 가능)"
-+        SubtitleService.start(app, videoUri, language, useVad)
-+    }
++    fun rawAvailable(entry: HistoryEntry) =
++        entry.rawFile.isNotEmpty() && HistoryStore.rawFile(app, entry.rawFile).exists()
 +
-+    fun save(uri: Uri) {
-+        val srt = lastSrt ?: return
-+        viewModelScope.launch(Dispatchers.IO) {
-+            app.contentResolver.openOutputStream(uri)?.use { it.write(srt.toByteArray(Charsets.UTF_8)) }
-+            JobState.status = "저장 완료"
-+        }
++    private fun displayName(uri: Uri): String = try {
++        app.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
++            if (it.moveToFirst()) it.getString(0) else null
++        } ?: "video"
++    } catch (e: Exception) {
++        "video"
 +    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt
 new file mode 100644
-index 0000000..228c8aa
+index 0000000..24c8105
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/WhisperHolder.kt
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,46 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -1036,6 +1435,14 @@ index 0000000..228c8aa
 +            modelName = model
 +            WhisperContext.createContextFromAsset(assets, "models/$model")
 +        }.also { ctx = it }
++    }
++
++    fun isLoaded() = ctx != null
++
++    /** 모델을 메모리에서 해제 (다음 작업 시작 시 자동으로 다시 불러옴) */
++    suspend fun release() = lock.withLock {
++        ctx?.release()
++        ctx = null
 +    }
 +
 +    /** assets/vad 의 VAD 모델을 앱 내부 폴더로 한 번 복사하고 경로를 반환 (없으면 null) */
