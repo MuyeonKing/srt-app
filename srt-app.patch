@@ -345,10 +345,10 @@ index 0000000..ed9d678
 +class CancelledByUser : Exception("사용자가 취소함")
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
-index 0000000..8c0d407
+index 0000000..8a2b7dd
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,117 @@
 +package com.whispercppdemo.subtitle
 +
 +import com.whispercpp.whisper.WhisperSegment
@@ -356,35 +356,109 @@ index 0000000..8c0d407
 +
 +object SrtWriter {
 +    private const val MAX_DURATION_MS = 7_000L
++    private const val MAX_CHARS = 25          // jni.c 의 max_len 과 같은 값
++    private const val MAX_REPEAT = 3          // 같은 문장 연속 반복 허용 횟수
 +
 +    // (スタッフ), （拍手）, [音楽] 같은 괄호 태그 제거
 +    private val tagPattern = Regex("""\([^)]*\)|（[^）]*）|\[[^\]]*]|【[^】]*】""")
++    private val japanese = Regex("""[\u3040-\u30ff\u4e00-\u9fff]""")
++    private val latin = Regex("""\p{IsLatin}""")
++    private val breakChars = "。、？！?!…♪ 　"
++    private val sentenceEnd = "。？！?!…"
 +
 +    private fun clean(text: String) = text.replace(tagPattern, " ").replace(Regex("\\s+"), " ").trim()
 +
-+    /** 같은 문장이 연속 [limit]회 이상 나오면 인식 오류(반복 생성)로 보고 해당 구간을 제거 */
-+    private fun dropLoops(list: List<WhisperSegment>, limit: Int = 5): List<WhisperSegment> {
++    /** 일본어 설정인데 라틴 문자가 더 많은 줄은 다른 언어로 잘못 출력된 오류로 보고 제거 (OK 같은 대문자 약어는 유지) */
++    private fun isForeignGarbage(text: String, language: String): Boolean {
++        if (language != "ja") return false
++        val lat = latin.findAll(text).count()
++        val jp = japanese.findAll(text).count()
++        val upperOnly = text.filter { it.isLetter() && !japanese.matches(it.toString()) }.all { it.isUpperCase() }
++        return lat >= 3 && lat > jp && !upperOnly
++    }
++
++    /** 같은 문장이 연속으로 반복되면 최대 [MAX_REPEAT]번까지만 남김 (감탄사는 살리고 도배만 방지) */
++    private fun collapseLoops(list: List<WhisperSegment>): List<WhisperSegment> {
 +        val out = mutableListOf<WhisperSegment>()
 +        var i = 0
 +        while (i < list.size) {
 +            var j = i
 +            while (j + 1 < list.size && list[j + 1].text == list[i].text) j++
-+            val runLength = j - i + 1
-+            if (runLength < limit) out.addAll(list.subList(i, j + 1))
++            out.addAll(list.subList(i, minOf(j + 1, i + MAX_REPEAT)))
 +            i = j + 1
 +        }
 +        return out
 +    }
 +
-+    fun toSrt(segments: List<WhisperSegment>): String = buildString {
-+        dropLoops(segments.map { it.copy(text = clean(it.text)) }.filter { it.text.isNotBlank() })
-+            .forEachIndexed { i, s ->
-+                // 자막 한 개의 표시 시간은 최대 7초 (Netflix 자막 가이드 기준)
-+                val end = minOf(s.endMs, s.startMs + MAX_DURATION_MS)
-+                append(i + 1).append('\n')
-+                append(ts(s.startMs)).append(" --> ").append(ts(end)).append('\n')
-+                append(s.text).append("\n\n")
++    /**
++     * 글자 수 제한(25자)으로 문장 중간에서 잘린 조각들을 다시 이어 붙인 뒤,
++     * 문장부호·띄어쓰기 위치에서 다시 나눈다. 시간은 글자 수 비율로 나눈다.
++     */
++    private fun fixWraps(list: List<WhisperSegment>): List<WhisperSegment> {
++        val out = mutableListOf<WhisperSegment>()
++        var i = 0
++        while (i < list.size) {
++            var j = i
++            // 앞 조각이 제한 길이에 가깝고, 문장이 끝나지 않았고, 시간이 바로 이어지면 같은 문장으로 봄
++            while (j + 1 < list.size &&
++                list[j].text.length >= MAX_CHARS - 5 &&
++                list[j].text.last() !in sentenceEnd &&
++                list[j + 1].startMs - list[j].endMs <= 500
++            ) j++
++            if (j == i) {
++                out.add(list[i])
++            } else {
++                out.addAll(resplit(list.subList(i, j + 1)))
 +            }
++            i = j + 1
++        }
++        return out
++    }
++
++    private fun resplit(group: List<WhisperSegment>): List<WhisperSegment> {
++        val text = group.joinToString("") { it.text }
++        val start = group.first().startMs
++        val span = group.last().endMs - start
++        val pieces = mutableListOf<String>()
++        var rest = text
++        // 남는 꼬리가 몇 글자뿐이면 굳이 나누지 않음 (최대 30자까지 한 자막 허용)
++        while (rest.length > MAX_CHARS + 5) {
++            // 문장부호·띄어쓰기를 우선 찾고 (최대 33자 범위), 없으면 25자에서 자름
++            val window = rest.substring(0, minOf(rest.length, MAX_CHARS + 8))
++            val cut = window.indexOfLast { it in breakChars }.let { if (it >= 7) it + 1 else MAX_CHARS }
++            pieces.add(rest.substring(0, cut).trim())
++            rest = rest.substring(cut)
++        }
++        if (rest.isNotBlank()) pieces.add(rest.trim())
++
++        val ps = pieces.filter { it.isNotEmpty() }
++        val total = ps.sumOf { it.length }.coerceAtLeast(1)
++        var t = start
++        return ps.mapIndexed { idx, p ->
++            val end = if (idx == ps.lastIndex) start + span else t + span * p.length / total
++            WhisperSegment(t, end, p).also { t = end }
++        }
++    }
++
++    /** 앱에서 쓰는 정리된 자막 */
++    fun toSrt(segments: List<WhisperSegment>, language: String): String {
++        val cleaned = segments.map { it.copy(text = clean(it.text)) }
++            .filter { it.text.isNotBlank() && !isForeignGarbage(it.text, language) }
++        return write(collapseLoops(fixWraps(cleaned)), capDuration = true)
++    }
++
++    /** 필터를 거치지 않은 원본 인식 결과 (원인 확인용) */
++    fun toRawSrt(segments: List<WhisperSegment>): String =
++        write(segments.filter { it.text.isNotBlank() }.map { it.copy(text = it.text.trim()) }, capDuration = false)
++
++    private fun write(list: List<WhisperSegment>, capDuration: Boolean): String = buildString {
++        list.forEachIndexed { i, s ->
++            // 자막 한 개의 표시 시간은 최대 7초 (Netflix 자막 가이드 기준)
++            val end = if (capDuration) minOf(s.endMs, s.startMs + MAX_DURATION_MS) else s.endMs
++            append(i + 1).append('\n')
++            append(ts(s.startMs)).append(" --> ").append(ts(end)).append('\n')
++            append(s.text).append("\n\n")
++        }
 +    }
 +
 +    private fun ts(ms: Long) = String.format(
@@ -394,7 +468,7 @@ index 0000000..8c0d407
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..723f867
+index 0000000..8ea7299
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 @@ -0,0 +1,88 @@
@@ -422,9 +496,9 @@ index 0000000..723f867
 +        videoUri: Uri,
 +        language: String,
 +        vadModelPath: String?,
-+        chunkMinutes: Int = 10,
++        chunkMinutes: Int = 2, // 인식이 어긋나도 피해가 최대 2분으로 제한되도록
 +        onStatus: (String) -> Unit
-+    ): String = withContext(Dispatchers.IO) {
++    ): List<WhisperSegment> = withContext(Dispatchers.IO) {
 +        val pcm = File(context.cacheDir, "audio_16k.pcm")
 +        val jobStart = System.currentTimeMillis()
 +        fun elapsed() = "경과 ${hms(System.currentTimeMillis() - jobStart)}"
@@ -474,7 +548,7 @@ index 0000000..723f867
 +                result.mapTo(segments) { it.copy(startMs = it.startMs + offsetMs, endMs = it.endMs + offsetMs) }
 +                start += n
 +            }
-+            SrtWriter.toSrt(segments)
++            segments
 +        } finally {
 +            pcm.delete()
 +        }
@@ -580,10 +654,10 @@ index 0000000..2ab0a5e
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..00d239b
+index 0000000..00c12b6
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,253 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -672,8 +746,10 @@ index 0000000..00d239b
 +            val whisper = WhisperHolder.get(this)
 +            val vadPath = if (useVad) WhisperHolder.vadModelPath(this) else null
 +            pipeline = SubtitlePipeline(this, whisper)
-+            val srt = pipeline.run(uri, language, vadPath) { update(it) }
++            val segments = pipeline.run(uri, language, vadPath) { update(it) }
++            val srt = SrtWriter.toSrt(segments, language)
 +            JobState.lastSrt = srt
++            autoSave(videoName, SrtWriter.toRawSrt(segments), suffix = "_raw")
 +            result = "완료"
 +            count = Regex(" --> ").findAll(srt).count()
 +            val savedAs = autoSave(videoName, srt)
@@ -730,9 +806,9 @@ index 0000000..00d239b
 +    }
 +
 +    /** Android 10 이상: Download/SRT/<영상이름>.srt 로 자동 저장 */
-+    private fun autoSave(videoName: String, srt: String): String? {
++    private fun autoSave(videoName: String, srt: String, suffix: String = ""): String? {
 +        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
-+        val fileName = videoName.substringBeforeLast('.') + ".srt"
++        val fileName = videoName.substringBeforeLast('.') + suffix + ".srt"
 +        return try {
 +            val values = ContentValues().apply {
 +                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
