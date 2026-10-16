@@ -27,10 +27,10 @@ index cf57850..f65f3e9 100644
  </manifest>
 \ No newline at end of file
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
-index 8bcae71..dfd12b0 100644
+index 8bcae71..c62d6d9 100644
 --- a/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/MainActivity.kt
-@@ -4,19 +4,33 @@ import android.os.Bundle
+@@ -4,19 +4,34 @@ import android.os.Bundle
  import androidx.activity.ComponentActivity
  import androidx.activity.compose.setContent
  import androidx.activity.viewModels
@@ -38,7 +38,8 @@ index 8bcae71..dfd12b0 100644
 -import com.whispercppdemo.ui.main.MainScreenViewModel
 +import androidx.compose.material3.Surface
 +import com.whispercppdemo.subtitle.JobState
-+import com.whispercppdemo.subtitle.LogBook
++import com.whispercppdemo.subtitle.Logs
++import com.whispercppdemo.subtitle.NightScreen
 +import com.whispercppdemo.subtitle.SubtitleScreen
 +import com.whispercppdemo.subtitle.SubtitleViewModel
  import com.whispercppdemo.ui.theme.WhisperCppDemoTheme
@@ -52,7 +53,7 @@ index 8bcae71..dfd12b0 100644
          setContent {
              WhisperCppDemoTheme {
 -                MainScreen(viewModel)
-+                Surface { SubtitleScreen(vm) }
++                Surface { if (vm.nightMode) NightScreen(vm) else SubtitleScreen(vm) }
              }
          }
      }
@@ -62,11 +63,11 @@ index 8bcae71..dfd12b0 100644
 +    // 작업 중에 앱 화면을 벗어나거나 돌아온 시점을 동작 기록에 남김
 +    override fun onStart() {
 +        super.onStart()
-+        if (JobState.running) LogBook.add(this, "앱 화면 복귀")
++        if (JobState.running) Logs.add(this, "앱 화면 복귀")
 +    }
 +
 +    override fun onStop() {
-+        if (JobState.running && !isChangingConfigurations) LogBook.add(this, "앱 화면 벗어남 (백그라운드)")
++        if (JobState.running && !isChangingConfigurations) Logs.add(this, "앱 화면 벗어남 (백그라운드)")
 +        super.onStop()
 +    }
 +}
@@ -308,10 +309,10 @@ index 0000000..2114f80
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
 new file mode 100644
-index 0000000..a7d2ee0
+index 0000000..be1bed1
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/History.kt
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,91 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -332,7 +333,8 @@ index 0000000..a7d2ee0
 +    val lang: String,
 +    val result: String,      // 완료 / 취소 / 오류
 +    val count: Int,          // 생성된 자막 수
-+    val rawFile: String = "" // 앱 내부에 보관한 원본 인식 결과 파일 이름
++    val rawFile: String = "", // 앱 내부에 보관한 원본 인식 결과 파일 이름
++    val jobId: Long = 0       // 영상별 동작 기록과 연결
 +) {
 +    fun summary(): String {
 +        val date = SimpleDateFormat("MM/dd HH:mm", Locale.KOREA).format(Date(time))
@@ -362,7 +364,7 @@ index 0000000..a7d2ee0
 +                HistoryEntry(
 +                    o.getLong("time"), o.getString("name"), o.getLong("videoMs"), o.getLong("procMs"),
 +                    o.getString("model"), o.getBoolean("vad"), o.getString("lang"),
-+                    o.getString("result"), o.getInt("count"), o.optString("rawFile", "")
++                    o.getString("result"), o.getInt("count"), o.optString("rawFile", ""), o.optLong("jobId", 0)
 +                )
 +            }
 +        } catch (e: Exception) {
@@ -375,7 +377,10 @@ index 0000000..a7d2ee0
 +        val all = listOf(e) + load(context)
 +        val list = all.take(MAX)
 +        // 기록에서 밀려난 항목의 원본 파일도 삭제
-+        all.drop(MAX).forEach { if (it.rawFile.isNotEmpty()) rawFile(context, it.rawFile).delete() }
++        all.drop(MAX).forEach {
++            if (it.rawFile.isNotEmpty()) rawFile(context, it.rawFile).delete()
++            if (it.jobId != 0L) JobLog.delete(context, it.jobId)
++        }
 +        val arr = JSONArray()
 +        list.forEach {
 +            arr.put(
@@ -383,7 +388,7 @@ index 0000000..a7d2ee0
 +                    .put("time", it.time).put("name", it.name).put("videoMs", it.videoMs)
 +                    .put("procMs", it.procMs).put("model", it.model).put("vad", it.vad)
 +                    .put("lang", it.lang).put("result", it.result).put("count", it.count)
-+                    .put("rawFile", it.rawFile)
++                    .put("rawFile", it.rawFile).put("jobId", it.jobId)
 +            )
 +        }
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, arr.toString()).apply()
@@ -393,17 +398,67 @@ index 0000000..a7d2ee0
 +    fun clear(context: Context) {
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
 +        rawDir(context).listFiles()?.forEach { it.delete() }
++        JobLog.deleteAll(context)
 +    }
 +
 +    fun rawDir(context: Context) = java.io.File(context.filesDir, "raw").apply { mkdirs() }
 +    fun rawFile(context: Context, name: String) = java.io.File(rawDir(context), name)
 +}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobLog.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobLog.kt
+new file mode 100644
+index 0000000..a0e2bc6
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobLog.kt
+@@ -0,0 +1,43 @@
++package com.whispercppdemo.subtitle
++
++import android.content.Context
++import java.io.File
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/** 영상별 동작 기록 (줄 수 제한 없이 전부 보관, 파일 하나당 영상 하나) */
++object JobLog {
++    private val lock = Any()
++    private fun dir(context: Context) = File(context.filesDir, "logs").apply { mkdirs() }
++    private fun file(context: Context, id: Long) = File(dir(context), "$id.txt")
++
++    fun append(context: Context, id: Long, message: String) = synchronized(lock) {
++        val time = SimpleDateFormat("MM/dd HH:mm:ss", Locale.KOREA).format(Date())
++        val line = "$time  $message"
++        file(context, id).appendText(line + "\n")
++        if (JobState.currentJobId == id) JobState.currentJobLog = JobState.currentJobLog + line
++    }
++
++    fun read(context: Context, id: Long): List<String> = synchronized(lock) {
++        val f = file(context, id)
++        if (f.exists()) f.readLines().filter { it.isNotBlank() } else emptyList()
++    }
++
++    fun exists(context: Context, id: Long) = file(context, id).exists()
++
++    fun delete(context: Context, id: Long) = synchronized(lock) { file(context, id).delete() }
++
++    fun deleteAll(context: Context) = synchronized(lock) { dir(context).listFiles()?.forEach { it.delete() } }
++}
++
++/** 기록 경로 선택: 처리 중인 영상이 있으면 그 영상의 기록, 없으면 대기 목록 기록 */
++object Logs {
++    fun add(context: Context, message: String) {
++        val id = JobState.currentJobId
++        if (id != null) JobLog.append(context, id, message) else LogBook.add(context, message)
++    }
++
++    /** 대기 목록 기록에 요약으로 남김 */
++    fun summary(context: Context, message: String) = LogBook.add(context, message)
++}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 new file mode 100644
-index 0000000..d28219e
+index 0000000..a2a1b5b
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,22 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.compose.runtime.getValue
@@ -416,7 +471,10 @@ index 0000000..d28219e
 +    var running by mutableStateOf(false)    // 대기 목록 처리 중
 +    var queue by mutableStateOf<List<QueueItem>>(emptyList())
 +    var history by mutableStateOf<List<HistoryEntry>>(emptyList())
-+    var log by mutableStateOf<List<String>>(emptyList())
++    var log by mutableStateOf<List<String>>(emptyList())         // 대기 목록 기록
++    var currentJobId by mutableStateOf<Long?>(null)              // 처리 중인 영상
++    var currentJobName by mutableStateOf("")
++    var currentJobLog by mutableStateOf<List<String>>(emptyList()) // 처리 중인 영상의 동작 기록
 +
 +    @Volatile
 +    var cancelRequested = false
@@ -462,6 +520,109 @@ index 0000000..ff8c83d
 +    fun clear(context: Context) = synchronized(lock) {
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
 +        JobState.log = emptyList()
++    }
++}
+diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
+new file mode 100644
+index 0000000..ed6241f
+--- /dev/null
++++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
+@@ -0,0 +1,97 @@
++package com.whispercppdemo.subtitle
++
++import android.app.Activity
++import androidx.compose.foundation.background
++import androidx.compose.foundation.gestures.detectTapGestures
++import androidx.activity.compose.BackHandler
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import kotlinx.coroutines.delay
++import kotlin.random.Random
++
++/**
++ * 야간 모드: 화면을 켜 둔 채(처리 속도 유지) 검은 화면 + 최저 밝기로 표시.
++ * - 처리 중에만 화면 꺼짐 방지, 목록이 끝나면 평소처럼 자동으로 꺼짐
++ * - 글자는 1분마다 위치를 옮겨 화면 잔상(번인) 방지
++ * - 길게 누르거나 뒤로 가기를 누르면 일반 화면으로 복귀 (자다가 스치는 터치로는 풀리지 않음)
++ */
++@Composable
++fun NightScreen(vm: SubtitleViewModel) {
++    // 뒤로 가기: 앱을 나가지 않고 일반 화면으로만 복귀
++    BackHandler { vm.setNight(false) }
++
++    val view = LocalView.current
++    val window = (LocalContext.current as? Activity)?.window
++
++    // 처리 중일 때만 화면 꺼짐 방지
++    DisposableEffect(vm.running) {
++        view.keepScreenOn = vm.running
++        onDispose { view.keepScreenOn = false }
++    }
++
++    // 밝기 최저 + 상단·하단 바 검게, 나갈 때 원래대로
++    DisposableEffect(Unit) {
++        val oldBrightness = window?.attributes?.screenBrightness ?: -1f
++        val oldStatus = window?.statusBarColor
++        val oldNav = window?.navigationBarColor
++        window?.let {
++            it.attributes = it.attributes.apply { screenBrightness = 0.01f }
++            it.statusBarColor = android.graphics.Color.BLACK
++            it.navigationBarColor = android.graphics.Color.BLACK
++        }
++        onDispose {
++            window?.let {
++                it.attributes = it.attributes.apply { screenBrightness = oldBrightness }
++                if (oldStatus != null) it.statusBarColor = oldStatus
++                if (oldNav != null) it.navigationBarColor = oldNav
++            }
++        }
++    }
++
++    var x by remember { mutableStateOf(0) }
++    var y by remember { mutableStateOf(0) }
++    LaunchedEffect(Unit) {
++        while (true) {
++            delay(60_000)
++            x = Random.nextInt(0, 160)
++            y = Random.nextInt(0, 520)
++        }
++    }
++
++    Box(
++        Modifier
++            .fillMaxSize()
++            .background(Color.Black)
++            .pointerInput(Unit) {
++                // 짧은 터치는 무시하고, 길게 누를 때만 복귀
++                detectTapGestures(onLongPress = { vm.setNight(false) })
++            }
++    ) {
++        Column(Modifier.offset(x.dp, y.dp).padding(24.dp)) {
++            Text(
++                if (vm.running) vm.status else "모든 작업 완료 · 화면이 곧 꺼집니다",
++                color = Color(0xFF505050),
++                fontSize = 12.sp
++            )
++            Text("화면을 길게 누르면 일반 화면으로 돌아갑니다", color = Color(0xFF303030), fontSize = 10.sp)
++        }
 +    }
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/QueueStore.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/QueueStore.kt
@@ -797,10 +958,10 @@ index 0000000..215d217
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..f255db0
+index 0000000..2241e7c
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,188 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.Manifest
@@ -825,6 +986,11 @@ index 0000000..f255db0
 +import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.unit.dp
@@ -889,6 +1055,8 @@ index 0000000..f255db0
 +            ) { Text(label) }
 +            OutlinedButton(onClick = { vm.cancel() }, enabled = vm.running) { Text("취소") }
 +        }
++        Button(onClick = { vm.setNight(true) }, enabled = vm.running) { Text("야간 모드 (화면 켜 둔 채 검게)") }
++        Text("화면이 꺼지면 처리 속도가 크게 느려집니다. 자면서 돌릴 때는 야간 모드를 켜 두세요.", style = small)
 +
 +        // ── 현재 상태 ──
 +        Text(vm.status)
@@ -920,14 +1088,28 @@ index 0000000..f255db0
 +            }
 +        }
 +
-+        // ── 동작 기록 ──
++        // ── 처리 중인 영상의 동작 기록 ──
++        var showAllCurrent by remember { mutableStateOf(false) }
++        if (vm.currentJobId != null) {
++            Divider()
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text("진행 중: ${vm.currentJobName}", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
++                TextButton(onClick = { showAllCurrent = !showAllCurrent }) {
++                    Text(if (showAllCurrent) "접기" else "더보기 (${vm.currentJobLog.size}줄)")
++                }
++            }
++            val lines = if (showAllCurrent) vm.currentJobLog else vm.currentJobLog.takeLast(10)
++            lines.reversed().forEach { Text(it, style = small) }
++        }
++
++        // ── 대기 목록 기록 (시작·완료 요약) ──
 +        Divider()
 +        Row(verticalAlignment = Alignment.CenterVertically) {
-+            Text("동작 기록 (최근 40줄)", style = MaterialTheme.typography.titleMedium)
++            Text("대기 목록 기록", style = MaterialTheme.typography.titleMedium)
 +            TextButton(onClick = { vm.clearLog() }, enabled = vm.log.isNotEmpty() && !vm.running) { Text("지우기") }
 +        }
 +        if (vm.log.isEmpty()) Text("기록 없음", style = small)
-+        vm.log.takeLast(40).reversed().forEach { Text(it, style = small) }
++        vm.log.takeLast(20).reversed().forEach { Text(it, style = small) }
 +
 +        // ── 처리 기록 ──
 +        Divider()
@@ -938,13 +1120,31 @@ index 0000000..f255db0
 +            }
 +        }
 +        if (vm.history.isEmpty()) Text("아직 기록이 없습니다.", style = small)
++        val expanded = remember { mutableStateMapOf<Long, Boolean>() }
++        @Suppress("UNUSED_VARIABLE") val version = vm.logVersion // 동작 기록 삭제 후 다시 그리기
 +        vm.history.forEach { entry ->
 +            Text(entry.summary(), style = small)
-+            if (vm.rawAvailable(entry)) {
-+                TextButton(onClick = {
-+                    vm.pendingRaw = entry
-+                    saveRaw.launch(entry.name.substringBeforeLast('.') + "_raw.srt")
-+                }) { Text("원본(raw) 저장") }
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                val hasLog = vm.jobLogExists(entry)
++                if (hasLog) {
++                    val open = expanded[entry.time] == true
++                    TextButton(onClick = { expanded[entry.time] = !open }) {
++                        Text(if (open) "동작 기록 접기" else "동작 기록 보기")
++                    }
++                    TextButton(onClick = {
++                        expanded[entry.time] = false
++                        vm.deleteJobLog(entry)
++                    }, enabled = !(vm.running && vm.currentJobId == entry.jobId)) { Text("동작 기록 지우기") }
++                }
++                if (vm.rawAvailable(entry)) {
++                    TextButton(onClick = {
++                        vm.pendingRaw = entry
++                        saveRaw.launch(entry.name.substringBeforeLast('.') + "_raw.srt")
++                    }) { Text("원본 저장") }
++                }
++            }
++            if (expanded[entry.time] == true && vm.jobLogExists(entry)) {
++                vm.jobLog(entry).forEach { Text(it, style = small) }
 +            }
 +            Divider()
 +        }
@@ -952,10 +1152,10 @@ index 0000000..f255db0
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..f6299a6
+index 0000000..1ac3754
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,315 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -1080,6 +1280,10 @@ index 0000000..f6299a6
 +        val all = QueueStore.load(this)
 +        val pos = all.indexOfFirst { it.id == item.id } + 1
 +        title = "자막 생성 중 ($pos/${all.size}) ${item.name}"
++        JobState.currentJobName = item.name
++        JobState.currentJobLog = JobLog.read(this, item.id) // 이어서 처리하는 경우 이전 기록 포함
++        JobState.currentJobId = item.id
++        Logs.summary(this, "▶ ${item.name} 시작")
 +        log("▶ ${item.name} 시작 (${if (item.lang == "ja") "일본어" else "영어"}, VAD ${if (item.vad) "켬" else "끔"})")
 +
 +        var pipeline: SubtitlePipeline? = null
@@ -1112,10 +1316,12 @@ index 0000000..f6299a6
 +            result = "완료"
 +            QueueStore.setState(this, item.id, "완료")
 +            log("✔ ${item.name} 완료 · 자막 ${count}개 · ${saved?.let { "Download/SRT/$it" } ?: "저장 실패"}")
++            Logs.summary(this, "✔ ${item.name} 완료 (${(System.currentTimeMillis() - started) / 60000}분)")
 +        } catch (e: CancelledByUser) {
 +            result = "취소"
 +            QueueStore.setState(this, item.id, "대기") // 취소한 파일은 대기 상태로 되돌림 (결과는 버림)
 +            log("■ ${item.name} 취소 (진행 결과 삭제)")
++            Logs.summary(this, "■ ${item.name} 취소")
 +        } catch (e: Exception) {
 +            if (JobState.cancelRequested) {
 +                result = "취소"
@@ -1124,6 +1330,7 @@ index 0000000..f6299a6
 +            } else {
 +                QueueStore.setState(this, item.id, "오류")
 +                log("✖ ${item.name} 오류: ${e.message}")
++                Logs.summary(this, "✖ ${item.name} 오류")
 +            }
 +        } finally {
 +            CheckpointStore.delete(this, item.id)
@@ -1140,11 +1347,13 @@ index 0000000..f6299a6
 +                        lang = item.lang,
 +                        result = result,
 +                        count = count,
-+                        rawFile = rawName
++                        rawFile = rawName,
++                        jobId = item.id
 +                    )
 +                )
 +            } catch (_: Exception) {
 +            }
++            JobState.currentJobId = null
 +        }
 +    }
 +
@@ -1184,7 +1393,7 @@ index 0000000..f6299a6
 +        else -> "종료 직전"
 +    }
 +
-+    private fun log(message: String) = LogBook.add(this, message)
++    private fun log(message: String) = Logs.add(this, message)
 +
 +    /** 진행 상황을 화면과 알림에 반영 (같은 문구면 알림 갱신 생략) */
 +    private fun update(text: String) {
@@ -1264,10 +1473,10 @@ index 0000000..f6299a6
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..97d883a
+index 0000000..ee12c18
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,164 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
@@ -1303,6 +1512,16 @@ index 0000000..97d883a
 +    // 선택했지만 아직 대기 목록에 넣지 않은 영상
 +    var selected by mutableStateOf<List<Pair<Uri, String>>>(emptyList())
 +        private set
++
++    // 야간 모드 (검은 화면 + 화면 켜짐 유지로 처리 속도 유지)
++    var nightMode by mutableStateOf(false)
++        private set
++
++    fun setNight(on: Boolean) {
++        if (nightMode == on) return
++        nightMode = on
++        Logs.add(app, if (on) "야간 모드 켜짐" else "야간 모드 꺼짐")
++    }
 +
 +    // 원본 저장을 누른 기록 항목
 +    var pendingRaw: HistoryEntry? = null
@@ -1377,6 +1596,24 @@ index 0000000..97d883a
 +    }
 +
 +    fun clearLog() = LogBook.clear(app)
++
++    // ── 영상별 동작 기록 ──
++    val currentJobId get() = JobState.currentJobId
++    val currentJobName get() = JobState.currentJobName
++    val currentJobLog get() = JobState.currentJobLog
++
++    // 기록을 지운 뒤 화면을 다시 그리기 위한 값
++    var logVersion by mutableStateOf(0)
++        private set
++
++    fun jobLogExists(entry: HistoryEntry) = entry.jobId != 0L && JobLog.exists(app, entry.jobId)
++
++    fun jobLog(entry: HistoryEntry): List<String> = JobLog.read(app, entry.jobId)
++
++    fun deleteJobLog(entry: HistoryEntry) {
++        JobLog.delete(app, entry.jobId)
++        logVersion++
++    }
 +
 +    /** 원본(raw) SRT를 사용자가 고른 위치에 저장 */
 +    fun saveRaw(target: Uri) {
