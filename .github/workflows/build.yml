@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write   # APK를 Releases에 올리기 위해 필요
     env:
       WHISPER_SHA: 0c7be696371069e0baa2515ed7aa08d5a5473aa6
       MODEL: ${{ inputs.model || 'large-v3-turbo-q5_0' }}
@@ -59,8 +61,13 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: srt-app-${{ env.MODEL }}
-          path: whisper/examples/whisper.android/app/build/outputs/apk/release/*.apk
+      - name: Publish APK (압축 없이 바로 받기)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls whisper/examples/whisper.android/app/build/outputs/apk/release/*.apk | head -1)
+          NAME="srt-app-$MODEL.apk"
+          cp "$APK" "$NAME"
+          gh release delete latest --yes --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create latest "$NAME" -R "$GITHUB_REPOSITORY" \
+            --title "최신 빌드 ($MODEL)" --notes "빌드 번호 ${{ github.run_number }}"
