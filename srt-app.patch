@@ -524,13 +524,17 @@ index 0000000..ff8c83d
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
 new file mode 100644
-index 0000000..ed6241f
+index 0000000..d3c5a1d
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,120 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Activity
++import android.os.Build
++import android.view.View
++import android.view.WindowInsets
++import android.view.WindowInsetsController
 +import androidx.compose.foundation.background
 +import androidx.compose.foundation.gestures.detectTapGestures
 +import androidx.activity.compose.BackHandler
@@ -560,6 +564,7 @@ index 0000000..ed6241f
 +/**
 + * 야간 모드: 화면을 켜 둔 채(처리 속도 유지) 검은 화면 + 최저 밝기로 표시.
 + * - 처리 중에만 화면 꺼짐 방지, 목록이 끝나면 평소처럼 자동으로 꺼짐
++ * - 상단 알림 표시줄·하단 바 숨김
 + * - 글자는 1분마다 위치를 옮겨 화면 잔상(번인) 방지
 + * - 길게 누르거나 뒤로 가기를 누르면 일반 화면으로 복귀 (자다가 스치는 터치로는 풀리지 않음)
 + */
@@ -586,12 +591,30 @@ index 0000000..ed6241f
 +            it.attributes = it.attributes.apply { screenBrightness = 0.01f }
 +            it.statusBarColor = android.graphics.Color.BLACK
 +            it.navigationBarColor = android.graphics.Color.BLACK
++            // 상단 알림 표시줄·하단 내비게이션 바 숨기기 (화면 끝을 쓸어내리면 잠시 나타남)
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                it.insetsController?.let { c ->
++                    c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
++                    c.hide(WindowInsets.Type.systemBars())
++                }
++            } else {
++                @Suppress("DEPRECATION")
++                it.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
++                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
++                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
++            }
 +        }
 +        onDispose {
 +            window?.let {
 +                it.attributes = it.attributes.apply { screenBrightness = oldBrightness }
 +                if (oldStatus != null) it.statusBarColor = oldStatus
 +                if (oldNav != null) it.navigationBarColor = oldNav
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                    it.insetsController?.show(WindowInsets.Type.systemBars())
++                } else {
++                    @Suppress("DEPRECATION")
++                    it.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
++                }
 +            }
 +        }
 +    }
@@ -711,10 +734,10 @@ index 0000000..9f60a1c
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
 new file mode 100644
-index 0000000..8a2b7dd
+index 0000000..c1db43e
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SrtWriter.kt
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,125 @@
 +package com.whispercppdemo.subtitle
 +
 +import com.whispercpp.whisper.WhisperSegment
@@ -731,6 +754,14 @@ index 0000000..8a2b7dd
 +    private val latin = Regex("""\p{IsLatin}""")
 +    private val breakChars = "。、？！?!…♪ 　"
 +    private val sentenceEnd = "。？！?!…"
++
++    // Whisper가 무음 구간에서 자주 지어내는 문장 (영상 끝 인사 등)
++    private val hallucinations = listOf(
++        "ご視聴ありがとうございました", "ご視聴ありがとうございます",
++        "チャンネル登録", "最後までご視聴", "Thank you for watching"
++    )
++
++    private fun isHallucination(text: String) = hallucinations.any { text.contains(it) }
 +
 +    private fun clean(text: String) = text.replace(tagPattern, " ").replace(Regex("\\s+"), " ").trim()
 +
@@ -809,7 +840,7 @@ index 0000000..8a2b7dd
 +    /** 앱에서 쓰는 정리된 자막 */
 +    fun toSrt(segments: List<WhisperSegment>, language: String): String {
 +        val cleaned = segments.map { it.copy(text = clean(it.text)) }
-+            .filter { it.text.isNotBlank() && !isForeignGarbage(it.text, language) }
++            .filter { it.text.isNotBlank() && !isForeignGarbage(it.text, language) && !isHallucination(it.text) }
 +        return write(collapseLoops(fixWraps(cleaned)), capDuration = true)
 +    }
 +
@@ -958,7 +989,7 @@ index 0000000..215d217
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..2241e7c
+index 0000000..becc8dc
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 @@ -0,0 +1,188 @@
@@ -1056,12 +1087,12 @@ index 0000000..2241e7c
 +            OutlinedButton(onClick = { vm.cancel() }, enabled = vm.running) { Text("취소") }
 +        }
 +        Button(onClick = { vm.setNight(true) }, enabled = vm.running) { Text("야간 모드 (화면 켜 둔 채 검게)") }
-+        Text("화면이 꺼지면 처리 속도가 크게 느려집니다. 자면서 돌릴 때는 야간 모드를 켜 두세요.", style = small)
++        Text("앱 화면이 떠 있을 때 가장 빠릅니다. 자면서 돌릴 때는 야간 모드를 켜 두세요.", style = small)
 +
 +        // ── 현재 상태 ──
 +        Text(vm.status)
 +        Text(
-+            if (vm.running) "작업 중에는 다른 앱을 쓰거나 화면을 꺼도 됩니다."
++            if (vm.running) "작업은 계속되지만, 앱을 벗어나거나 화면이 꺼지면 처리가 크게 느려집니다. 야간 모드를 권장합니다."
 +            else "백그라운드 작업 없음",
 +            style = small
 +        )
