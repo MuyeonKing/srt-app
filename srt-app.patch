@@ -455,10 +455,10 @@ index 0000000..a0e2bc6
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
 new file mode 100644
-index 0000000..a2a1b5b
+index 0000000..8590553
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/JobState.kt
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,27 @@
 +package com.whispercppdemo.subtitle
 +
 +import androidx.compose.runtime.getValue
@@ -478,9 +478,14 @@ index 0000000..a2a1b5b
 +
 +    @Volatile
 +    var cancelRequested = false
++
++    @Volatile
++    var pauseRequested = false
 +}
 +
 +class CancelledByUser : Exception("사용자가 취소함")
++
++class PausedByUser : Exception("사용자가 일시정지함")
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/LogBook.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/LogBook.kt
 new file mode 100644
 index 0000000..ff8c83d
@@ -865,10 +870,10 @@ index 0000000..c1db43e
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
 new file mode 100644
-index 0000000..215d217
+index 0000000..9c029a0
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitlePipeline.kt
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,119 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -983,16 +988,17 @@ index 0000000..215d217
 +
 +    private fun checkCancel() {
 +        if (JobState.cancelRequested) throw CancelledByUser()
++        if (JobState.pauseRequested) throw PausedByUser()
 +    }
 +
 +    private fun hms(ms: Long) = "%d:%02d:%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..becc8dc
+index 0000000..502ed87
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,189 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.Manifest
@@ -1084,6 +1090,7 @@ index 0000000..becc8dc
 +                onClick = { vm.enqueueAndStart() },
 +                enabled = vm.selected.isNotEmpty() || (!vm.running && vm.hasUnfinished)
 +            ) { Text(label) }
++            OutlinedButton(onClick = { vm.pause() }, enabled = vm.running) { Text("일시정지") }
 +            OutlinedButton(onClick = { vm.cancel() }, enabled = vm.running) { Text("취소") }
 +        }
 +        Button(onClick = { vm.setNight(true) }, enabled = vm.running) { Text("야간 모드 (화면 켜 둔 채 검게)") }
@@ -1183,10 +1190,10 @@ index 0000000..becc8dc
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
 new file mode 100644
-index 0000000..1ac3754
+index 0000000..1643733
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleService.kt
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,369 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Notification
@@ -1241,6 +1248,16 @@ index 0000000..1ac3754
 +    override fun onBind(intent: Intent?): IBinder? = null
 +
 +    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_PAUSE) {
++            if (running) {
++                JobState.pauseRequested = true
++                WhisperContext.requestAbort()
++                update("일시정지하는 중...")
++            } else {
++                stopSelf()
++            }
++            return START_NOT_STICKY
++        }
 +        if (intent?.action == ACTION_CANCEL) {
 +            if (running) {
 +                JobState.cancelRequested = true
@@ -1266,6 +1283,7 @@ index 0000000..1ac3754
 +        running = true
 +        JobState.running = true
 +        JobState.cancelRequested = false
++        JobState.pauseRequested = false
 +        wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
 +            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "srtapp:transcribe")
 +            .apply { acquire(24 * 60 * 60 * 1000L) } // 안전장치: 최대 24시간
@@ -1280,20 +1298,32 @@ index 0000000..1ac3754
 +    private suspend fun runQueue() {
 +        log("대기 목록 처리 시작")
 +        try {
-+            while (!JobState.cancelRequested) {
++            while (!JobState.cancelRequested && !JobState.pauseRequested) {
 +                val item = QueueStore.next(this) ?: break
 +                processItem(item)
 +            }
 +        } finally {
 +            val cancelled = JobState.cancelRequested
++            val paused = JobState.pauseRequested
 +            try {
 +                WhisperHolder.release()
 +            } catch (_: Exception) {
 +            }
-+            log(if (cancelled) "취소됨 · 모델 메모리 해제" else "대기 목록 완료 · 모델 메모리 해제")
-+            JobState.status = if (cancelled) "취소됨 (남은 항목은 대기 상태로 유지)" else "작업 없음 (모델 메모리 해제됨)"
++            log(
++                when {
++                    paused -> "일시정지 · 모델 메모리 해제"
++                    cancelled -> "취소됨 · 모델 메모리 해제"
++                    else -> "대기 목록 완료 · 모델 메모리 해제"
++                }
++            )
++            JobState.status = when {
++                paused -> "일시정지됨 · [이어서 처리]를 누르면 멈춘 2분 구간부터 다시 시작합니다"
++                cancelled -> "취소됨 (남은 항목은 대기 상태로 유지)"
++                else -> "작업 없음 (모델 메모리 해제됨)"
++            }
 +            JobState.running = false
 +            JobState.cancelRequested = false
++            JobState.pauseRequested = false
 +            try {
 +                unregisterReceiver(screenReceiver)
 +            } catch (_: Exception) {
@@ -1321,6 +1351,7 @@ index 0000000..1ac3754
 +        var result = "오류"
 +        var count = 0
 +        var rawName = ""
++        var paused = false
 +        try {
 +            if (!WhisperHolder.isLoaded()) {
 +                update("모델 불러오는 중...")
@@ -1348,13 +1379,17 @@ index 0000000..1ac3754
 +            QueueStore.setState(this, item.id, "완료")
 +            log("✔ ${item.name} 완료 · 자막 ${count}개 · ${saved?.let { "Download/SRT/$it" } ?: "저장 실패"}")
 +            Logs.summary(this, "✔ ${item.name} 완료 (${(System.currentTimeMillis() - started) / 60000}분)")
++        } catch (e: PausedByUser) {
++            paused = true
 +        } catch (e: CancelledByUser) {
 +            result = "취소"
 +            QueueStore.setState(this, item.id, "대기") // 취소한 파일은 대기 상태로 되돌림 (결과는 버림)
 +            log("■ ${item.name} 취소 (진행 결과 삭제)")
 +            Logs.summary(this, "■ ${item.name} 취소")
 +        } catch (e: Exception) {
-+            if (JobState.cancelRequested) {
++            if (JobState.pauseRequested) {
++                paused = true
++            } else if (JobState.cancelRequested) {
 +                result = "취소"
 +                QueueStore.setState(this, item.id, "대기")
 +                log("■ ${item.name} 취소 (진행 결과 삭제)")
@@ -1364,6 +1399,14 @@ index 0000000..1ac3754
 +                Logs.summary(this, "✖ ${item.name} 오류")
 +            }
 +        } finally {
++            if (paused) {
++                // 일시정지: 진행 상태를 남겨 두고 '처리중' 그대로 유지 → [이어서 처리]로 재개
++                val at = CheckpointStore.load(this, item.id)?.let { hms(it.nextStart * 1000 / AudioDecoder.TARGET_RATE) }
++                log("⏸ 일시정지" + (at?.let { " · $it 지점부터 이어서 처리 가능" } ?: " · 오디오 추출부터 다시 시작"))
++                Logs.summary(this, "⏸ ${item.name} 일시정지")
++                JobState.currentJobId = null
++                return
++            }
 +            CheckpointStore.delete(this, item.id)
 +            try {
 +                JobState.history = HistoryStore.add(
@@ -1391,7 +1434,7 @@ index 0000000..1ac3754
 +    /** 과열(심각 단계 이상)이거나, 충전 중이 아닌데 배터리 20% 미만이면 대기 */
 +    private suspend fun waitIfNeeded() {
 +        var waiting = false
-+        while (!JobState.cancelRequested) {
++        while (!JobState.cancelRequested && !JobState.pauseRequested) {
 +            val hot = thermalStatus() >= PowerManager.THERMAL_STATUS_SEVERE
 +            val bm = getSystemService(BatteryManager::class.java)
 +            val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
@@ -1425,6 +1468,8 @@ index 0000000..1ac3754
 +    }
 +
 +    private fun log(message: String) = Logs.add(this, message)
++
++    private fun hms(ms: Long) = "%d:%02d:%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
 +
 +    /** 진행 상황을 화면과 알림에 반영 (같은 문구면 알림 갱신 생략) */
 +    private fun update(text: String) {
@@ -1471,6 +1516,17 @@ index 0000000..1ac3754
 +            )
 +            .addAction(
 +                Notification.Action.Builder(
++                    Icon.createWithResource(this, android.R.drawable.ic_media_pause),
++                    "일시정지",
++                    PendingIntent.getService(
++                        this, 2,
++                        Intent(this, SubtitleService::class.java).setAction(ACTION_PAUSE),
++                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++                    )
++                ).build()
++            )
++            .addAction(
++                Notification.Action.Builder(
 +                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
 +                    "취소",
 +                    PendingIntent.getService(
@@ -1490,11 +1546,16 @@ index 0000000..1ac3754
 +
 +    companion object {
 +        const val ACTION_CANCEL = "com.whispercppdemo.subtitle.CANCEL"
++        const val ACTION_PAUSE = "com.whispercppdemo.subtitle.PAUSE"
 +        private const val CH_PROGRESS = "progress"
 +        private const val ID_PROGRESS = 1
 +
 +        fun start(context: Context) {
 +            context.startForegroundService(Intent(context, SubtitleService::class.java))
++        }
++
++        fun pause(context: Context) {
++            context.startService(Intent(context, SubtitleService::class.java).setAction(ACTION_PAUSE))
 +        }
 +
 +        fun cancel(context: Context) {
@@ -1504,10 +1565,10 @@ index 0000000..1ac3754
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..ee12c18
+index 0000000..88fd09a
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,169 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
@@ -1607,6 +1668,11 @@ index 0000000..ee12c18
 +            JobState.status = "시작 중... (알림창에서 진행 상황 확인 가능)"
 +            SubtitleService.start(app)
 +        }
++    }
++
++    fun pause() {
++        JobState.status = "일시정지하는 중..."
++        SubtitleService.pause(app)
 +    }
 +
 +    fun cancel() {
