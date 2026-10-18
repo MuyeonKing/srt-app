@@ -251,10 +251,10 @@ index 0000000..9a2337f
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt
 new file mode 100644
-index 0000000..2114f80
+index 0000000..147e273
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/Checkpoint.kt
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,55 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.content.Context
@@ -300,6 +300,9 @@ index 0000000..2114f80
 +        tmp.writeText(o.toString())
 +        tmp.renameTo(jsonFile(context, id))
 +    }
++
++    /** 진행 상태 파일이 있는지만 가볍게 확인 (화면 갱신용) */
++    fun exists(context: Context, id: Long) = jsonFile(context, id).exists()
 +
 +    /** 작업이 끝나면(완료·취소·오류) 임시 오디오와 진행 상태를 삭제 */
 +    fun delete(context: Context, id: Long) {
@@ -529,10 +532,10 @@ index 0000000..ff8c83d
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
 new file mode 100644
-index 0000000..d3c5a1d
+index 0000000..253369a
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/NightScreen.kt
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,134 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Activity
@@ -565,6 +568,9 @@ index 0000000..d3c5a1d
 +import androidx.compose.ui.unit.sp
 +import kotlinx.coroutines.delay
 +import kotlin.random.Random
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
 +
 +/**
 + * 야간 모드: 화면을 켜 둔 채(처리 속도 유지) 검은 화면 + 최저 밝기로 표시.
@@ -624,6 +630,16 @@ index 0000000..d3c5a1d
 +        }
 +    }
 +
++    // 현재 시각 (10초마다 갱신)
++    var clock by remember { mutableStateOf("") }
++    LaunchedEffect(Unit) {
++        val fmt = SimpleDateFormat("HH:mm", Locale.KOREA)
++        while (true) {
++            clock = fmt.format(Date())
++            delay(10_000)
++        }
++    }
++
 +    var x by remember { mutableStateOf(0) }
 +    var y by remember { mutableStateOf(0) }
 +    LaunchedEffect(Unit) {
@@ -644,6 +660,7 @@ index 0000000..d3c5a1d
 +            }
 +    ) {
 +        Column(Modifier.offset(x.dp, y.dp).padding(24.dp)) {
++            Text(clock, color = Color(0xFF5A5A5A), fontSize = 44.sp)
 +            Text(
 +                if (vm.running) vm.status else "모든 작업 완료 · 화면이 곧 꺼집니다",
 +                color = Color(0xFF505050),
@@ -995,10 +1012,10 @@ index 0000000..9c029a0
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
 new file mode 100644
-index 0000000..502ed87
+index 0000000..233d152
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleScreen.kt
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,199 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.Manifest
@@ -1048,6 +1065,10 @@ index 0000000..502ed87
 +        ActivityResultContracts.CreateDocument("application/x-subrip")
 +    ) { uri -> if (uri != null) vm.saveRaw(uri) }
 +
++    val savePartial = rememberLauncherForActivityResult(
++        ActivityResultContracts.CreateDocument("application/x-subrip")
++    ) { uri -> if (uri != null) vm.savePartial(uri) }
++
 +    val small = MaterialTheme.typography.bodySmall
 +
 +    Column(
@@ -1094,6 +1115,12 @@ index 0000000..502ed87
 +            OutlinedButton(onClick = { vm.cancel() }, enabled = vm.running) { Text("취소") }
 +        }
 +        Button(onClick = { vm.setNight(true) }, enabled = vm.running) { Text("야간 모드 (화면 켜 둔 채 검게)") }
++        vm.partialItem()?.let { item ->
++            OutlinedButton(onClick = { savePartial.launch(vm.partialFileName(item)) }) {
++                Text("지금까지 진행분 SRT 저장")
++            }
++            Text("2분 구간 단위로 저장된 지점까지의 자막입니다. 처리 중이어도 저장할 수 있습니다.", style = small)
++        }
 +        Text("앱 화면이 떠 있을 때 가장 빠릅니다. 자면서 돌릴 때는 야간 모드를 켜 두세요.", style = small)
 +
 +        // ── 현재 상태 ──
@@ -1565,10 +1592,10 @@ index 0000000..1643733
 +}
 diff --git a/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
 new file mode 100644
-index 0000000..88fd09a
+index 0000000..37466f9
 --- /dev/null
 +++ b/examples/whisper.android/app/src/main/java/com/whispercppdemo/subtitle/SubtitleViewModel.kt
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,200 @@
 +package com.whispercppdemo.subtitle
 +
 +import android.app.Application
@@ -1723,6 +1750,37 @@ index 0000000..88fd09a
 +                JobState.status = "원본 저장 완료: ${entry.name}"
 +            } catch (e: Exception) {
 +                JobState.status = "원본 저장 실패: ${e.message}"
++            }
++        }
++    }
++
++    /** 진행 중(또는 일시정지된) 항목의 지금까지 결과가 있는지 */
++    fun partialItem(): QueueItem? {
++        val q = queue // 대기 목록이 바뀌면 다시 확인
++        val item = q.firstOrNull { it.state == "처리중" } ?: return null
++        return if (CheckpointStore.exists(app, item.id)) item else null
++    }
++
++    fun partialFileName(item: QueueItem): String {
++        val cp = CheckpointStore.load(app, item.id)
++        val ms = (cp?.nextStart ?: 0L) * 1000 / AudioDecoder.TARGET_RATE
++        val at = "%d%02d%02d".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
++        return item.name.substringBeforeLast('.') + "_partial_" + at + ".srt"
++    }
++
++    /** 지금까지 인식된 부분만 SRT로 저장 (정리 규칙 적용) */
++    fun savePartial(target: Uri) {
++        val item = QueueStore.load(app).firstOrNull { it.state == "처리중" } ?: return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val cp = CheckpointStore.load(app, item.id) ?: throw IllegalStateException("진행 결과가 없습니다")
++                if (cp.segments.isEmpty()) throw IllegalStateException("아직 인식된 구간이 없습니다")
++                val srt = SrtWriter.toSrt(cp.segments, item.lang)
++                app.contentResolver.openOutputStream(target)?.use { it.write(srt.toByteArray(Charsets.UTF_8)) }
++                val ms = cp.nextStart * 1000 / AudioDecoder.TARGET_RATE
++                JobState.status = "진행분 저장 완료 (0:00:00 ~ %d:%02d:%02d)".format(ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
++            } catch (e: Exception) {
++                JobState.status = "진행분 저장 실패: ${e.message}"
 +            }
 +        }
 +    }
